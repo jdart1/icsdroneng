@@ -143,21 +143,7 @@ void Prompt(mask){
     if((mask & PROXY) && !runData.inhibitPrompt){
 	SendToProxy("%s", runData.lastIcsPrompt);
     }
-#ifdef HAVE_LIBREADLINE
-  if((mask & CONSOLE) && appData.console && !runData.inhibitPrompt){
-    if(runData.inReadline){
-      rl_reset_line_state();
-      rl_redisplay();
-    }else{
-      rl_callback_handler_install(runData.prompt,ProcessConsoleLineRed);  
-    }
-    runData.promptOnLine=TRUE;
-    runData.inReadline=TRUE;
-    runData.blockConsole=FALSE;
-  }
-#else
       runData.blockConsole=FALSE;
-#endif
 }
 
 /*
@@ -1199,11 +1185,6 @@ Bool ProcessTells(char *line){
 	ProcessTourneyNotifications(tmp);
       }
     } else{
-      if(appData.console){
-#ifdef HAVE_LIBREADLINE
-	rl_ding();
-#endif
-      }
       SetFeedbackColor(appData.colorTell);
       Feedback(CONSOLE|OWNER|SHORTLOG,"%s: %s",name,tmp);
       UnsetFeedbackColor();
