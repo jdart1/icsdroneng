@@ -669,7 +669,7 @@ int main(int argc, char *argv[])
                 fp=NULL;
                 InitRunData();
 #ifdef HAVE_LIBREADLINE
-                rl_catch_signals=0;
+                //rl_catch_signals=0;
                 setupterm((char *)0, 1, (int *)0);
 #endif
                 srandom(time(NULL));
