@@ -1,5 +1,5 @@
 /*
-icsdroneng, Copyright (c) 2008-2009, Michel Van den Bergh
+icsdroneng, Copyright (c) 2008-2016, Michel Van den Bergh
 All rights reserved
 
 This version contains code from polyglot and links against readline. 
@@ -64,6 +64,7 @@ void InitRunData(){
   runData.computerReadFd=-1;
   runData.computerWriteFd=-1;
   runData.computerPid=(pid_t) 0;
+  runData.computerCrashes=0;
   runData.icsReadFd=-1;
   runData.icsWriteFd=-1;
   runData.proxyListenFd=-1;
@@ -74,7 +75,7 @@ void InitRunData(){
   runData.waitingForFirstBoard=FALSE;
   runData.exitValue=0;
   runData.gameID=-1;
-  runData.moveNum=-1;
+  runData.nextMoveNum=-1;
   runData.waitingForPingID=0;
   runData.oppname=NULL;
   runData.forwarding=FALSE;
@@ -147,6 +148,8 @@ void InitRunData(){
   strcpy(runData.chessVariant,"normal");
   runData.noCastle=FALSE;
   runData.engineMovesPlayed=0;
+  runData.computerIsThinking=FALSE;
+  runData.computerOpponent=FALSE;
 }
 
 PersistentData persistentData;
@@ -212,11 +215,16 @@ AppData appData = {
     COLOR_DEFAULT,   /* colorDefault */
     0,               /* hardLimit */
     TRUE,            /* acceptDraw */
+    FALSE,           /* acceptAdjourn */
     TRUE,            /* autoReconnect */
     FALSE,           /* ownerQuiet */
     NULL,            /* feedbackCommand */
     FALSE,           /* engineQuiet */
-    NULL             /* variants */
+    NULL,            /* variants */
+    TRUE,            /* engineKnowsSAN */
+    NULL,            /* tourneyFilter */
+    NULL,            /* matchFilter */
+    1,               /* bailoutStrategy */
 };
 
 int  ProcessRawInput P((int, char *, int, void (*)(char *, char*)));
@@ -254,22 +262,33 @@ void ProcessConsoleLine(char *line, char *queue)
 }
 
 void SetInterface(){
+  char gitversion1[128];
   char *uptime=strdup(asctime(gmtime(&persistentData.startTime)));
+#ifdef GIT
+  strcpy(gitversion1+1,gitversion);
+  gitversion1[0]='-';
+  gitversion1[17]='\0';
+#else
+  gitversion1[0]='\0';
+#endif
   uptime=strtok(uptime,"\r\n");
   logme(LOG_DEBUG,"Setting interface. runData.icsType=%d\n",runData.icsType);
+  /* We don't want to send a potential reply to "set interface" to the proxy */
+  SendMarker(STARTINTERNAL);
   if(runData.icsType==ICS_FICS){
       if(runData.myname[0]){
-	  SendToIcs("set interface %s-%s + %s. Online since %s GMT (%d games played).\n",PACKAGE_NAME,VERSION,runData.myname,uptime,persistentData.games);
+	  SendToIcs("set interface %s-%s%s + %s. Online since %s GMT (%d games played).\n",PACKAGE_NAME,VERSION,gitversion1,runData.myname,uptime,persistentData.games);
       }else{
-	  SendToIcs("set interface %s-%s. Online since: %s GMT (%d games played).\n",PACKAGE_NAME,VERSION,uptime,persistentData.games);
+	  SendToIcs("set interface %s-%s%s. Online since: %s GMT (%d games played).\n",PACKAGE_NAME,VERSION,gitversion1,uptime,persistentData.games);
       }
   }else{
       if(runData.myname[0]){
-	  SendToIcs("set interface %s-%s + %s. Online since %s GMT.\n",PACKAGE_NAME,VERSION,runData.myname,uptime);
+	  SendToIcs("set interface %s-%s%s + %s. Online since %s GMT.\n",PACKAGE_NAME,VERSION,gitversion1,runData.myname,uptime);
       }else{
-	  SendToIcs("set interface %s-%s. Online since: %s GMT.\n",PACKAGE_NAME,VERSION,uptime);
+	  SendToIcs("set interface %s-%s%s. Online since: %s GMT.\n",PACKAGE_NAME,VERSION,gitversion1,uptime);
       }
   }
+  SendMarker(STOPINTERNAL);
   free(uptime);
 }
 
@@ -347,8 +366,6 @@ void OpenTimeseal(){
   }else if(runData.timesealPid>0){
     close(from_fds[1]);
     close(to_fds[0]);
-    //    printf("timeseal: closed %d %d\n",from_fds[1],to_fds[0]);
-    //printf("timeseal: inuse %d %d\n",from_fds[0],to_fds[1]);
     runData.icsReadFd=from_fds[0];
     runData.icsWriteFd=to_fds[1];
   }else{
@@ -371,17 +388,20 @@ void MainLoop()
   int maxfd;
   struct timeval timeout;
   char cBuf[2*BUF_SIZE], sBuf[2*BUF_SIZE];
+#ifndef HAVE_LIBREADLINE
   char conBuf[2*BUF_SIZE];
+#endif
   char proxyBuf[2*BUF_SIZE];
   int selectVal;
   int events;
   struct sockaddr_in client_addr;  
   unsigned int sin_size;
-  //  InitRunData();
   BlockSignals();
   sBuf[0] = '\0';
   cBuf[0] = '\0';
+#ifndef HAVE_LIBREADLINE
   conBuf[0]='\0';
+#endif
   proxyBuf[0]='\0';
   while (1) {
     UpdateTimeString();
@@ -436,12 +456,14 @@ void MainLoop()
     if (runData.computerActive && FD_ISSET(runData.computerReadFd, &readfds)){
       if (ProcessRawInput(runData.computerReadFd, cBuf, sizeof(cBuf), 
 			  ProcessComputerLine) == ERROR){
-	  //	ExitOn(EXIT_HARDQUIT,"Lost contact with computer.");
-	  logme(LOG_DEBUG,"Lost contact with computer.");
-	  logme(LOG_DEBUG,"Bailing out.");
-	  SendToIcs("resign\n");
-	  RawKillComputer();
-	  StartComputer();
+	  if(runData.computerCrashes++<=2){
+	      logme(LOG_ERROR,"Computer crashes=%d",runData.computerCrashes);
+	      BailOut("Lost contact with computer. Bailing out.");
+	      RawKillComputer();
+	      StartComputer();
+	  }else{
+	      ExitOn(EXIT_HARDQUIT,"Too many engine crashes. Quitting...");
+	  }
       }
     }
     if (runData.proxyFd!=-1 && FD_ISSET(runData.proxyFd, &readfds)){
@@ -644,6 +666,10 @@ int main(int argc, char *argv[])
     InitPersistentData();
 #ifndef HAVE_LIBREADLINE
     printf("No readline support.\n");
+#else
+#ifndef HAVE_COLOR
+    printf("No color.\n");
+#endif
 #endif
 #ifndef HAVE_LIBZ
     printf("No zlib support.\n");
@@ -655,12 +681,20 @@ int main(int argc, char *argv[])
     SetOption("program",LOGIN,0,"%s","gnuchess");
     SetOption("sendTimeout",LOGIN,0,"%s","resume");
     SetOption("feedbackCommand",LOGIN,0,"%s","whisper");
+    SetOption("tourneyFilter",LOGIN,0,"%s","ct.chess");
+    SetOption("matchFilter",LOGIN,0,"%s","true");
     if (ParseArgs(argc, argv) == ERROR)
         Usage();
     signal(SIGINT, TerminateProc);
     signal(SIGTERM, TerminateProc);
     signal(SIGHUP, TerminateProc);
     signal(SIGPIPE, BrokenPipe);
+
+    /*
+     * Initialize virtual machine :-)
+     */
+
+    ics_wrap_init();
     
     while(exitValue==EXIT_RESTART){
         switch(setjmp(stackPointer)){
@@ -669,8 +703,10 @@ int main(int argc, char *argv[])
                 fp=NULL;
                 InitRunData();
 #ifdef HAVE_LIBREADLINE
-                //rl_catch_signals=0;
+                rl_catch_signals=0;
+#ifdef HAVE_COLOR
                 setupterm((char *)0, 1, (int *)0);
+#endif
 #endif
                 srandom(time(NULL));
                 create_timer(&(runData.pingTimer),PINGINTERVAL,SendPing,NULL);
@@ -769,7 +805,6 @@ int main(int argc, char *argv[])
                 if(appData.daemonize){
                     Daemonize();
                 }
-		//                StartComputer();
                 SendToIcs("set style 12\n"
                           "set shout 0\n"
                           "set cshout 0\n"
@@ -788,6 +823,8 @@ int main(int argc, char *argv[])
 			  "iset fr 1\n"
 			  "iset losers 1\n"
 			  "iset suicide 1\n"
+			  "iset wildcastle 1\n"
+			  "iset startpos 1\n"
                           "iset lock 1\n"
                           "td set tourneyinfo on\n"
                           "td set autostart yes\n"

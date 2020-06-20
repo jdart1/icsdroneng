@@ -65,12 +65,14 @@ void CloseProxy(){
 }
 
 void DisconnectProxy(){
-    logme(LOG_DEBUG,"Disconnecting proxy.");
     if(runData.proxyFd!=-1){
-	close(runData.proxyFd);
+	if(close(runData.proxyFd)==-1){
+	    logme(LOG_ERROR,"Error closing proxy.");
+	}
 	runData.proxyFd=-1;
     }
     runData.proxyLoginState=PROXY_LOGIN_INIT;
+    logme(LOG_DEBUG,"Proxy disconnected.");
 }
 
 void SendToProxy(char *format, ... )

@@ -1,5 +1,5 @@
 /*
-icsdroneng, Copyright (c) 2008-2009, Michel Van den Bergh
+icsdroneng, Copyright (c) 2008-2016, Michel Van den Bergh
 All rights reserved
 
 This version contains code from polyglot and links against readline. 

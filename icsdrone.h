@@ -71,16 +71,22 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #ifdef HAVE_LIBREADLINE
 #include <readline/readline.h>
 #include <readline/history.h>
-#include <curses.h>
 // the following is for cygwin
 #ifdef HAVE_TERM_H
 #include <term.h>
+#define HAVE_COLOR
 #else
 #ifdef HAVE_NCURSES_TERM_H
 #include <ncurses/term.h>
+#define HAVE_COLOR
 #endif
 #endif
 #endif
+
+#ifdef HAVE_NCURSES_H
+#include <ncurses.h>
+#endif
+
 
 #include <signal.h>
 
@@ -89,6 +95,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <netinet/in.h>
 #endif
 
+#include "eval.h"
+
+#ifdef GIT
+extern const char *gitversion;
+#endif 
 
 /*
  * Main data structures
@@ -110,13 +121,18 @@ extern jmp_buf stackPointer;
 #define MS 15
 typedef char move_t[MS+1];
 
-#define MAXVARIANTS 35
-#define MAXENGINEVARIANTS 35
+#define MAXVARIANTS 100
+#define MAXENGINEVARIANTS 100
 
 /* Mock boolean type */
 
 #undef FALSE
 #undef TRUE
+
+/* To signal start up error of engine */
+
+#define MAGIC "%$#@!"
+#define MAGIC_LENGTH 5
 
 typedef enum { FALSE = 0, TRUE = 1 } Bool;
 typedef enum {ICS_ICC, ICS_FICS, ICS_VARIANT, ICS_GENERIC} IcsType;
@@ -177,6 +193,7 @@ typedef struct {
   int   computerReadFd;
   int   computerWriteFd;
   pid_t computerPid;
+  int   computerCrashes;
   int   icsReadFd;
   int   icsWriteFd;
   int   proxyListenFd;
@@ -185,9 +202,10 @@ typedef struct {
   char  passwd[30];
   Bool  quitPending;
   Bool  waitingForFirstBoard;
+  Bool  adjournedGame;
   int   exitValue;
   int   gameID;
-  int   moveNum;
+  int   nextMoveNum;
   int   waitingForPingID;
   char* oppname;
   Bool forwarding;
@@ -205,6 +223,7 @@ typedef struct {
   char moveList[8192];
   char last_talked_to[30+1];
   IcsBoard icsBoard;
+  char initialFen[256];
   char lineBoard[512];
   Bool waitingForMoveList;
   Bool promptOnLine;
@@ -261,6 +280,8 @@ typedef struct {
   char chessVariant[30+1];
   Bool noCastle;
   int engineMovesPlayed;
+  int computerIsThinking;
+  Bool computerOpponent;
 } RunData;
 
 /* AppData */
@@ -314,11 +335,16 @@ typedef struct {
     int colorDefault;
     int hardLimit;
     Bool acceptDraw;
+    Bool acceptAdjourn;
     Bool autoReconnect;
     Bool ownerQuiet;
     char * feedbackCommand;
     Bool engineQuiet;
     char * variants;
+    Bool engineKnowsSAN;
+    char *tourneyFilter;
+    char *matchFilter;
+    int bailoutStrategy;
 } AppData;
 
 extern PersistentData  persistentData;
@@ -380,7 +406,7 @@ extern void InterruptComputer P(());
 extern void EnsureComputerReady P(());
 extern void ProcessComputerLine P((char *line, char *queue)); 
 extern void Force P(());
-extern void Go P(());
+extern void ensureEngineIsThinking P(());
 extern void Level P((int,int));
 extern void SecondsPerMove P((int));
 extern void Result P((char *));
@@ -418,6 +444,7 @@ extern void Feedback P((int mask, char *format, ... ));
 extern char *myfgets P((char *s, int size, FILE *stream));
 extern void strip_nts P((char *s, char *strip));
 void CancelTimers P(());
+extern void BailOut P((char *s));
 #define PINGINTERVAL 60*1000
 #define PINGWINDOW 2
 #define RECONNECTINTERVAL 30
@@ -484,12 +511,14 @@ extern int  MonthNumber P((char *));
 extern void BlockSignals P(());
 extern void UnblockSignals P(());
 extern int  SetOption P((char *,int,int, char *, ...));
+extern int GetOption(char*, char *);
 extern struct timeval time_diff P((struct timeval,struct timeval));
 extern Bool time_ge P((struct timeval,struct timeval));
 extern Bool time_gt P((struct timeval,struct timeval));
 extern struct timeval time_add P((struct timeval tv, int t));
 extern void my_sleep P((int msec));
 extern Bool IsWhiteSpace P((char *s));
+extern void SendToConsole(char *, ...);
 /*
  * Logging
  */
@@ -542,7 +571,8 @@ void book_move P((IcsBoard *icsBoard, book_move_t * bmove, Bool random));
 void ProcessConsoleLine P((char *, char *));
 void Prompt P(());
 
-#ifndef HAVE_LIBREADLINE
+//#ifndef HAVE_LIBREADLINE
+#ifndef HAVE_NCURSES_H
 #define COLOR_DEFAULT 0
 #define COLOR_ALERT 0
 #define COLOR_TELL 0
@@ -601,6 +631,9 @@ extern Bool IsAMarker P((char *));
 #define NETNEWLINE "\r\n"
 #define PID_T pid_t
 
+/*
+ * Virtual machine
+ */ 
 
-
+void ics_wrap_init();
 

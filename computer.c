@@ -1,5 +1,5 @@
 /*
-icsdroneng, Copyright (c) 2008-2009, Michel Van den Bergh
+icsdroneng, Copyright (c) 2008-2016, Michel Van den Bergh
 All rights reserved
 
 This version contains code from polyglot and links against readline. 
@@ -44,7 +44,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // Leave for now as things seem to work.
  
 static int validKibitzSeen=0;
-static int depth=0,eval=0,time_=0,nodes=0;
+static int depth=0,eval_=0,time_=0,nodes=0;
 static int resignScoreSeen=0;
 static char pv[256]="";
 static Bool forceMode=FALSE;
@@ -53,9 +53,10 @@ static Bool forceMode=FALSE;
 void Force(){
   SendToComputer("force\n");
   forceMode=TRUE;
+  /* What happens if this happens while the computer is thinking? */
 }
 
-void Go(){
+void ensureEngineIsThinking(){
   /* Avoid sending go several times.
    * This seems to disturb some engines.
    */
@@ -66,6 +67,7 @@ void Go(){
 	  SendToComputer("go\n");
     }
   forceMode=FALSE;
+  runData.computerIsThinking=TRUE;
 }
 
 void Depth(int depth){
@@ -101,6 +103,7 @@ void SecondsPerMove(int seconds){
 
 void Result(char * result){
   SendToComputer("result %s\n", result);
+  runData.computerIsThinking=FALSE;
 }
 
 void EnsureComputerReady(){
@@ -127,7 +130,7 @@ void SendBoardToComputer(IcsBoard *board, Bool ignoreStartBoard){
       char tmp[256];
 	tmp[0]='\0';
 	strcat(tmp,"setboard ");
-	BoardToFen(tmp+9,&runData.icsBoard);
+	BoardToFen(tmp+9,board);
 	if(!strcmp(tmp+9,StartFen) && ignoreStartBoard){
 	    logme(LOG_DEBUG,"Do not send the board, since it is the start board for variant normal.");
 	    return;
@@ -161,6 +164,9 @@ void SendMoveToComputer(move_t move){
   }else{
     SendToComputer("usermove %s\n", move);
   }
+  if(!forceMode){
+      runData.computerIsThinking=TRUE;
+  }
 }
 				   
 
@@ -177,7 +183,10 @@ void PingComputer()
   SendToComputer("ping %d\n", runData.waitingForPingID);
 }
 
-
+void StartUpError(char * msg){
+    logme(LOG_ERROR,msg);
+    printf("%s%s\n",MAGIC,msg);
+}
 
 void StartComputer()
 {
@@ -201,42 +210,57 @@ void StartComputer()
   case -1:
     ExitOn(EXIT_HARDQUIT,"Unable to create new process!\n");
   case 0:
+      /* we are the child */
     logme(LOG_DEBUG,"Setting priority of Engine to %d.",appData.nice);
     if(nice(appData.nice)==-1){
       logme(LOG_ERROR,"Unable to set priority of engine");
     }
-    close(fileno(stdin));
-    if(dup(fdin[0])==-1){
-      ExitOn(EXIT_HARDQUIT,"Unable to duplicate fdin!\n");
-    }
-    close(fileno(stdout));
-    if(dup(fdout[1])==-1){
-      ExitOn(EXIT_HARDQUIT,"Unable to duplicate fdout!\n");
+    /* make stdin refer to read end fdin[0] of pipe fdin */
+    if(dup2(fdin[0],STDIN_FILENO)==-1){
+	/* gcc forces us to look at the return value of dup2. */
+       logme(LOG_ERROR,"Unable to set stdin of engine!\n");
     }
     close(fdin[0]);
-    close(fdin[1]);
-    close(fdout[0]);
+    /* make stdout refer to write end fdout[1] of pipe fdout */
+    if(dup2(fdout[1],STDOUT_FILENO)==-1){
+	/* gcc forces us to look at the return value of dup2. */
+       logme(LOG_ERROR,"Unable to set stdout of engine!\n");
+    }
     close(fdout[1]);
+    /* close unused ends of the pipes */
+    close(fdin[1]);  /* write end of engine's stdin pipe */
+    close(fdout[0]); /* read end of engine's stdout pipe */
+    /* make appData.program into an argument array */
     strcpy(buf, appData.program);
     p = strtok(buf, " ");
     do {
       argv[argc++] = strdup(p);
     } while ((p = strtok(NULL, " ")));
     argv[argc] = NULL;
+    /* Why is this necessary? */
     if(setsid()<0){
-      ExitOn(EXIT_HARDQUIT,"Could not put engine in its own session.");
+	StartUpError("Could not put engine in its own session.");
+	goto wait_for_eof;
     }
-    dup2(fileno(stdout),STDERR_FILENO); /* Redirect stderr to stdout, like '2>&1' in sh */
+    /* Redirect stderr to stdout, like '2>&1' in sh */
+    dup2(STDOUT_FILENO,STDERR_FILENO); 
     UnblockSignals();
-    if(execvp(argv[0], argv)==-1){
-      ExitOn(EXIT_HARDQUIT,"Unable to execute chess program!  (have you supplied the correct path/filename?)\n");
-    }
+    execvp(argv[0], argv);
+    /* execvp() only returns when an error has occured */
+    BlockSignals();
+    StartUpError("Unable to execute chess program! Have you supplied the correct path/filename?");
+ wait_for_eof:
+    while(fgets(buf,1023,stdin));
+    exit(0);
     break;
   default:
-    close(fdin[0]);
-    close(fdout[1]);
-    runData.computerReadFd = fdout[0];
-    runData.computerWriteFd = fdin[1];
+    /* we are the parent */
+    /* close unused ends of pipes */  
+    close(fdin[0]);  /* read end of engine's stdin */
+    close(fdout[1]); /* write end of engine's stdout */
+    /* save pipe ends for further use */
+    runData.computerReadFd = fdout[0]; /* read end of engine's stdout */
+    runData.computerWriteFd = fdin[1]; /* write end of engine's stdin */
     break;
   } 
   logme(LOG_DEBUG,"Declaring computer active");
@@ -259,6 +283,8 @@ void ResetComputer(){
     SendToComputer("\nforce\nnew\neasy\n");
   }
   validKibitzSeen=0;
+  runData.computerIsThinking=FALSE;
+  runData.computerOpponent=FALSE;
 }
 
 void RawKillComputer(){
@@ -303,6 +329,7 @@ void KillComputer()
     logme(LOG_INFO, "Killing computer");
     if (runData.sigint) InterruptComputer();
     SendToComputer("quit\nexit\n");
+    close(runData.computerWriteFd);
     RawKillComputer();
 }
 
@@ -348,7 +375,7 @@ void PVFeedback(){
     if(!appData.feedback && !appData.proxyFeedback) return;
     snprintf(feedbackBuffer,sizeof(feedbackBuffer)-1,"depth=%d score=%0.2f time=%0.2f node=%d speed=%d pv=%s",
               depth,
-              (eval+0.0)/100,
+              (eval_+0.0)/100,
               (time_+0.0)/100,
               nodes,
               time_?(int)(100*(nodes+0.0)/time_):0,
@@ -373,7 +400,7 @@ void ParseEngineVariants(char *line){
     evc=0;
     line1=strdup(line);
     line_save=line1;
-    line2=strstr(line1,"variants");
+    line2=strstr(line1,"variants=");
     if(line2){
 	line1=line2;
     }else{
@@ -385,15 +412,16 @@ void ParseEngineVariants(char *line){
     variant=strtok(variant_list," ,");
     while(variant){
 	if(evc==MAXENGINEVARIANTS){
+	    logme(LOG_ERROR,"Maximum variant count %d hit.\n",evc);
 	    goto finish;
 	}
 	strncpy(runData.chessVariants[evc++],variant,30);
 	logme(LOG_DEBUG,"engine supports variant \"%s\"",variant);
 	variant=strtok(NULL," ,");
     }
-    runData.chessVariantCount=evc;
 	
  finish:
+    runData.chessVariantCount=evc;
     logme(LOG_DEBUG,"engine supports %d variants",runData.chessVariantCount);
     free(line_save);
 }
@@ -402,18 +430,26 @@ void ProcessComputerLine(char *line, char *queue)
 {
   move_t move;
   char *tmp;
+  /* some dummy variables for sscanf parsing */
+  char c;
+  int d1,d2;
+  char ss[11];
+
   logcomm("engine","icsdrone", line);
-  
   if (sscanf(line, "%*s ... %15s", move) == 1 ||
       sscanf(line, "move %15s", move) == 1) {
+      /* reset crash counter */
+    runData.computerCrashes=0;
+
     if (runData.gameID != -1) {
       runData.engineMovesPlayed++;
+      runData.computerIsThinking=FALSE;
       if((appData.feedback || appData.proxyFeedback) && validKibitzSeen){
 	PVFeedback();
       }
-      if(appData.resign && validKibitzSeen && eval<RESIGN_SCORE){
+      if(appData.resign && validKibitzSeen && eval_<RESIGN_SCORE){
 	resignScoreSeen++;
-        logme(LOG_DEBUG,"Resign score %d < %d seen.",eval,RESIGN_SCORE);
+        logme(LOG_DEBUG,"Resign score %d < %d seen.",eval_,RESIGN_SCORE);
 	logme(LOG_DEBUG,"Resign score seen %d consecutive times.",
 	      resignScoreSeen);
       }else{
@@ -431,7 +467,7 @@ void ProcessComputerLine(char *line, char *queue)
 	if(appData.acceptDraw && 
 	   runData.registeredDrawOffer &&
 	   validKibitzSeen &&
-	   EvalDraw(eval)){
+	   EvalDraw(eval_)){
 	   SendToIcs("draw\n");
 	}else if(runData.registeredDrawOffer){
 	  SendToComputer("draw\n");
@@ -446,14 +482,19 @@ void ProcessComputerLine(char *line, char *queue)
     }
   }else if(line[0]=='#'){
     /* Comment! Ignore. */
-  }else if(!strncasecmp(line,"Illegal move",12) && runData.inGame){
+  }else if(!strncasecmp(line,MAGIC,MAGIC_LENGTH)){
+      /* The engine failed to start */
+      ExitOn(EXIT_HARDQUIT,line);
+  }else if((!strncasecmp(line,"Illegal move",12) 
+	   ||
+	    (!strncasecmp(line,"Error",5) && strstr(line, "llegal move")))
+	   && runData.inGame){
       /* 
        * We have the problem that the illegal move might be from a previous game.
        * It is not completely clear that this is the right test though.
        */
       if(runData.engineMovesPlayed>0){
-      	logme(LOG_DEBUG,"Something bad happened. Bailing out.");
-	SendToIcs("resign\n");
+	BailOut("The engine claims the ICS move is illegal... Bailing out.");
       }else{
 	logme(LOG_DEBUG,"Not bailing out since we are at the start of the game.");
       }
@@ -515,7 +556,7 @@ void ProcessComputerLine(char *line, char *queue)
       logme(LOG_DEBUG,"draw offers will not be passed to engine");
       runData.engineDrawFeature=FALSE;  /* zippy v2 */
     }
-    if (strstr(line," variants")){
+    if (strstr(line," variants=")){
 	ParseEngineVariants(line);
     }
     if (strstr(line, " done=1")) {
@@ -538,11 +579,18 @@ void ProcessComputerLine(char *line, char *queue)
           // probably we should send "draw <move>" but this requires cooperation
           // from the engine...
       SendToIcs("draw\n");
+      runData.computerIsThinking=FALSE;
   } else if (!strncmp(line,"offer draw",10)) {
       SendToIcs("draw\n");
+      runData.computerIsThinking=FALSE;
   } else if (!strncmp(line, "resign",6)) {
-    SendToIcs("resign\n");
-  } else if (!appData.engineQuiet && !strncmp(line, "tellics ", 8)) {
+      SendToIcs("resign\n");
+      runData.computerIsThinking=FALSE;
+  } else if (sscanf(line,"%d-%d {%10s resigns%c",&d1,&d2,ss,&c)==4) {
+      SendToIcs("resign\n");
+      runData.computerIsThinking=FALSE;
+  } 
+  else if (!appData.engineQuiet && !strncmp(line, "tellics ", 8)) {
       SendToIcs("%s\n", line + 8);
   } else if(!appData.engineQuiet && !strncmp(line,"tellothers ",11)) {
     SendToIcs("whisper %s\n",line+11);
@@ -557,8 +605,8 @@ void ProcessComputerLine(char *line, char *queue)
     SendToIcs("%s\n", line);
   } else {
     if(sscanf(line,"%d%*[ .+]%d %d %d %254[^\r\n]",
-	      &depth,&eval,&time_,&nodes,pv)==5){
-        if(appData.scoreForWhite && !runData.computerIsWhite)eval=-eval;
+	      &depth,&eval_,&time_,&nodes,pv)==5){
+        if(appData.scoreForWhite && !runData.computerIsWhite)eval_=-eval_;
       validKibitzSeen=1;
       if(time_>=500 && appData.feedback && !appData.feedbackOnlyFinal){
 	PVFeedback();

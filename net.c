@@ -1,5 +1,5 @@
 /*
-icsdroneng, Copyright (c) 2008-2009, Michel Van den Bergh
+icsdroneng, Copyright (c) 2008-2016, Michel Van den Bergh
 All rights reserved
 
 This version contains code from polyglot and links against readline. 
@@ -96,6 +96,10 @@ void SendToIcs(char *format, ... )
   va_start(ap, format);
   vsnprintf(buf, sizeof(buf), format, ap);
   buf[sizeof(buf)-1]='\0';
+  // make sure we end with a newline
+  if(strlen(buf)>0 && buf[strlen(buf)-1]!='\n'){
+      strcat(buf,"\n");
+  }
   logcomm("icsdrone","ics", buf);
   WRITE(runData.icsWriteFd, buf); 
   va_end(ap);
@@ -115,6 +119,20 @@ void SendToComputer(char *format, ... )
     }
 }
 
+void SendToConsole(char *format, ... )
+{
+  char buf[16384] = "";
+  va_list ap;
+  
+  va_start(ap, format);
+  vsnprintf(buf, sizeof(buf), format, ap);
+  buf[sizeof(buf)-1]='\0';
+  logcomm("icsdrone","console", buf);
+  printf("%s",buf);
+  va_end(ap);
+}
+
+
 #define TS_NONE 0
 #define TS_IAC 1
 #define TS_CMD 2
@@ -122,7 +140,7 @@ int ProcessRawInput(int fd, char *buf, int sizeofbuf, void (*LineFunc)(char *lin
 {
     int i, state, num, pos = strlen(buf);
     u_char c;
-    char tmp[1024];
+    char tmp[2*BUF_SIZE];
     num = read(fd, buf + pos, sizeofbuf - pos - 1);
     if ((num == -1) && ((errno == EWOULDBLOCK) || (errno == EAGAIN))) {
 	return NETOK;
@@ -135,27 +153,36 @@ int ProcessRawInput(int fd, char *buf, int sizeofbuf, void (*LineFunc)(char *lin
 	return ERROR;          
     } else if (num > 0) {
 	buf[(pos += num)] = '\0';
-	
-	/* strip out any '\r' first */
-	char *source=buf, *dest=buf;
-	while ((c=(*dest++=*source++))!='\0')
-	  if (c == '\r')
-	  {
-	    dest--;
-	    pos--;
-	  }
-	
 	state = TS_NONE; i = 0;
 	while ((c = buf[i++])) {
 	    switch(state) {
 	    case TS_NONE:
 		if (c == IAC) {
 		    state = TS_IAC;
-		} else if (c == '\n') {
+		} else if ((c == '\n') || (c == '\r')) {
 		    /* scan the input */
+		    /*stringcopy(tmp, buf, i-1);*/
+		    int u, nl_seen;
 		    strncpy(tmp,buf,i);
 		    tmp[i]='\0';
+		    u=i; 
+		    /* timeseal on Windows generates \r\n\r as eol sequence!
+                       We consider any sequence of consecutive \n and \r's containing
+                       at most one \n to be an eol sequence. */
+		    nl_seen=(c=='\n');
+		    while ((!nl_seen && ( buf[i]=='\r' || buf[i]=='\n')) || (nl_seen && buf[i]=='\r')) {
+		        if(buf[i]=='\n'){
+			  nl_seen=TRUE;
+		        }
+			if(u<sizeof(tmp)){
+			    tmp[u]=buf[i];
+			    tmp[u+1]='\0';
+			    i++;
+			    u++;
+			}
+		    }
 		    LineFunc(tmp,buf+i);
+		    /*bytecopy(buf, buf + i, pos+1 - i);*/
 		    memmove(buf, buf + i, pos+1 - i);
 		    i = 0;
 		}
@@ -163,13 +190,15 @@ int ProcessRawInput(int fd, char *buf, int sizeofbuf, void (*LineFunc)(char *lin
 	    case TS_IAC:
 		if (c == WILL || c == WONT || c == DO || c == DONT) {
 		    state = TS_CMD;
-		} else if (c == IP) {  /* disconnection */
-		    return ERROR;   
 		} else {               
 		    state = TS_NONE;
 		    /*bytecopy(buf, buf + i, pos+1 - i);*/
 		    memmove(buf, buf + i, pos+1 - i);
 		    i = 0;
+		}
+		if (c == IP) {  /* disconnection */
+		    logme(LOG_ERROR,"Disconnection in ProcessRawInput().\n");
+		    return ERROR;   
 		}
 		break;
 	    case TS_CMD:

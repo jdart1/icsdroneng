@@ -1,5 +1,5 @@
 /*
-icsdroneng, Copyright (c) 2008-2009, Michel Van den Bergh
+icsdroneng, Copyright (c) 2008-2016, Michel Van den Bergh
 All rights reserved
 
 This version contains code from polyglot and links against readline. 
@@ -90,11 +90,16 @@ ArgList argList = {
     {"-colorDefault",         ArgInt,    &appData.colorDefault      , 1 },
     {"-hardLimit",            ArgInt,    &appData.hardLimit         , 1 },
     {"-acceptDraw",           ArgBool,   &appData.acceptDraw        , 1 },
+    {"-acceptAdjourn",        ArgBool,   &appData.acceptAdjourn     , 1 },
     {"-autoReconnect",        ArgBool,   &appData.autoReconnect     , 1 },
     {"-ownerQuiet",           ArgBool,   &appData.ownerQuiet        , 1 },
     {"-feedbackCommand",      ArgString, &appData.feedbackCommand   , 1 },
     {"-engineQuiet",          ArgBool,   &appData.engineQuiet       , 1 },
     {"-variants",             ArgString, &appData.variants          , 0 },
+    {"-engineKnowsSAN",       ArgBool,   &appData.engineKnowsSAN    , 0 },
+    {"-tourneyFilter",        ArgString, &appData.tourneyFilter     , 1 },
+    {"-matchFilter",          ArgString, &appData.matchFilter       , 1 },
+    {"-bailoutStrategy",      ArgInt,    &appData.bailoutStrategy   , 0 },
     {NULL,                    ArgNull,   NULL                       , 0 } 
 };
 

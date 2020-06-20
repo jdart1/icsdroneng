@@ -1,5 +1,5 @@
 /*
-icsdroneng, Copyright (c) 2008-2009, Michel Van den Bergh
+icsdroneng, Copyright (c) 2008-2016, Michel Van den Bergh
 All rights reserved
 
 This version contains code from polyglot and links against readline. 
@@ -66,7 +66,7 @@ int MonthNumber(char *month){
 }
 
 void SetColor(int color){
-#ifdef HAVE_LIBREADLINE
+#ifdef HAVE_COLOR
   char *p;
   int real_color=color;
   if(color>7)color-=8;
@@ -83,7 +83,7 @@ void SetColor(int color){
 }
 
 void ResetColor(){
-#ifdef HAVE_LIBREADLINE
+#ifdef HAVE_COLOR
   if(set_a_foreground && orig_pair){
     putp(orig_pair);
   }
@@ -294,12 +294,18 @@ void ConvIcsSpecialToComp(char onMove, move_t move)
     if(ConvIcsCastlingToLan(onMove,move)){
 	return;
     }
+    /* Weird LAN on FICS for drop moves. */
     /* P/@@-fr --> P@fr */
     if(!strncmp(move+1,"/@@",3)){
 	move[1]='@';
 	move[2]=move[5];
 	move[3]=move[6];
 	move[4]='\0';
+	return;
+    }
+    /* ICC does it correctly for a change. */
+    if(move[1]=='@'){
+	/* do nothing! */
 	return;
     }
     /*  P/fr-fr=P --> frfrp  */
@@ -539,3 +545,24 @@ Bool IsWhiteSpace(char *s){
      }
      return TRUE;
  }
+
+// for cross compiling (recommended by autoconf docs).
+
+#if HAVE_CONFIG_H
+# include <config.h>
+#endif
+#undef malloc
+    
+#include <sys/types.h>
+
+void *malloc ();
+
+/* Allocate an N-byte block of memory from the heap.
+   If N is zero, allocate a 1-byte block.  */
+   
+void* rpl_malloc (size_t n)
+{
+ if (n == 0)
+    n = 1;
+ return malloc (n);
+}

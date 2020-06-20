@@ -1,5 +1,5 @@
 /*
-icsdroneng, Copyright (c) 2008-2009, Michel Van den Bergh
+icsdroneng, Copyright (c) 2008-2016, Michel Van den Bergh
 All rights reserved
 
 This version contains code from polyglot and links against readline.
@@ -49,6 +49,21 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define MAX_PGN_FILE_LINE	80
 
 
+void BailOut(char *msg){
+    logme(LOG_DEBUG,"%s",msg);
+    if(appData.bailoutStrategy==0){
+	logme(LOG_ERROR,"Ignoring bailout command as appData.bailoutStrategy is set to 0.");
+	logme(LOG_ERROR,"It is possible that icsdrone behaves incorrectly now.");
+	return;
+    }
+    Feedback(CONSOLE|OWNER|PROXY|SHORTLOG,"%s",msg);
+    SendToIcs("say %s",msg);
+    if(appData.bailoutStrategy>=2){
+	ExitOn(EXIT_HARDQUIT,msg);
+    }else{
+	SendToIcs("resign\n");
+    }
+}
 
 void InternalIcsCommand(char *command){
     SendMarker(STARTINTERNAL);
@@ -143,7 +158,21 @@ void Prompt(mask){
     if((mask & PROXY) && !runData.inhibitPrompt){
 	SendToProxy("%s", runData.lastIcsPrompt);
     }
+#ifdef HAVE_LIBREADLINE
+  if((mask & CONSOLE) && appData.console && !runData.inhibitPrompt){
+    if(runData.inReadline){
+      rl_reset_line_state();
+      rl_redisplay();
+    }else{
+      rl_callback_handler_install(runData.prompt,ProcessConsoleLineRed);  
+    }
+    runData.promptOnLine=TRUE;
+    runData.inReadline=TRUE;
+    runData.blockConsole=FALSE;
+  }
+#else
       runData.blockConsole=FALSE;
+#endif
 }
 
 /*
@@ -249,11 +278,12 @@ void Feedback(int mask,char *format,...){
     }
     va_start(ap,format); 
     if(runData.promptOnLine){
-      printf("\n");
+	SendToConsole("\n");
     }
     runData.promptOnLine=0;
-    vprintf(format,ap);
-    printf("\n");
+    vsnprintf(buf,sizeof(buf),format,ap);
+    buf[sizeof(buf)-1]='\0';
+    SendToConsole("%s\n",buf);
     va_end(ap);
     ResetColor();
     if(runData.multiFeedbackDepth==0){
@@ -354,6 +384,42 @@ int SetOption(char* name, int flags, int mask, char* format, ...){
   return found;
 }
 
+int GetOption(char* name, char * value){
+  ArgTuple *a=argList;	
+  int found=0;
+  value[0]='\0';
+  while(a->argName){
+      if(!strcasecmp((a->argName)+1,name)){
+      found=1;
+      switch(a->argType){
+      case ArgString:
+	  // returning the empty string is not really right...
+	  if(*((char **) a->argValue)){
+	      strcat(value,*((char **) a->argValue));
+	  }
+	  break;
+      case ArgInt:
+	  snprintf(value,99,"%d",*((int *) a->argValue));
+	  break;
+      case ArgBool:
+	  if( *((int *) a->argValue) == TRUE){
+	      strcat(value,"true");
+	  }else{
+	      strcat(value,"false");
+	  }
+	break;
+      case ArgNull:
+	logme(LOG_ERROR,"Internal error");
+	break;
+      }
+      break;
+    }
+    a++;
+  }
+  return found;
+}
+
+
 void ExecFile(char * filename, int mask, int inhibitSet){
   FILE *f;
   char buf[256];
@@ -397,6 +463,7 @@ void StopForwarding(int mask){
 void ExecCommand(char * command, int mask, int inhibitSet){
   int i;
   char key[256];
+  value_t result[1];
   char value[8192];
   char *strip_command;
   /* delete white space */
@@ -440,11 +507,32 @@ void ExecCommand(char * command, int mask, int inhibitSet){
     SendOptions(1,mask);
   } else if(sscanf(command,"load %8191[^\n\r]",value)==1){
       ExecFile(value,mask,inhibitSet); 
-  } else if(((i=sscanf(command,"set %254[^=\n\r ] %8191[^\n\r]", key,value))==1)  || (i==2)){
+  } else if(sscanf(command,"exec %8191[^\n\r]",value)==1) {
+      eval(result,"%s",value);
+      // temporary
+      if(0){
+      }else if(result->type==V_STRING){
+	  Feedback(mask,"\"%s\"",result->string_value->data);
+      }else if(result->type==V_BOOLEAN){
+	  Feedback(mask,"%s",result->value?"true":"false");
+      }else if(result->type==V_CFUNC){
+	  Feedback(mask,"<C function: %p>",result->cfunc_value);
+      }else if(result->type==V_NONE){
+	  Feedback(mask,"none");
+      }else if(result->type==V_ERROR){
+	  Feedback(mask,"<error:%d>",result->value);
+      }else{
+	  Feedback(mask,"%g",result->value);
+      }
+  }else if(((i=sscanf(command,"set %254[^=\n\r ] %8191[^\n\r]", key,value))==1)  || (i==2)){
       if(mask & (CONSOLE|PROXY)){
       runData.inhibitPrompt=TRUE;
     }
-      if(!inhibitSet){
+      /*
+       * This is not quite right. I we are unregistered and we relogin we should only
+       * redo the FICS set commands....Unfortunately this seems logically too convoluted now.
+       */
+      if(!inhibitSet || !runData.registered){
 	  if(i==1){
 	      if(!SetOption(key,CLEAR,mask,"%s",value)){
 		  StartForwarding(mask);
@@ -475,8 +563,9 @@ void ExecCommand(char * command, int mask, int inhibitSet){
     Feedback(mask,"           issuerematch sendgamestart acceptonly feedback feedbackonlyfinal");
     Feedback(mask,"           feedbackcommand proxyfeedback pgnlogging scoreforwhite ");
     Feedback(mask,"           sendtimeout shortlogfile shortlogging sendlogin hardlimit");
-    Feedback(mask,"           noplay autojoin autoreconnect resign acceptdraw scoreforwhite ");
-    Feedback(mask,"           ownerquiet enginequiet colortell coloralert colordefault");
+    Feedback(mask,"           noplay autojoin autoreconnect resign acceptdraw acceptadjourn");
+    Feedback(mask,"           scoreforwhite ownerquiet enginequiet colortell coloralert");
+    Feedback(mask,"           colordefault");
     Feedback(mask,"Read the manual page or README file for more information.");
     StopMultiFeedback(mask);
   }else if(!strncmp(command,"help",4)){
@@ -572,7 +661,33 @@ Bool EngineToMove(IcsBoard * icsBoard){
 }
 
 
-void HandleBoard(IcsBoard * icsBoard, char *moveList, Bool ignoreMove){
+/****************************************************************
+ *
+ * The responsibility of HandleBoard is to set up the engine
+ * correctly when it is its turn to move. This involves sending 
+ * it the appropriate time, otim and possibly go commands.
+ *
+ * Setting up the engine will usually also involve sending it
+ * the last move played by the opponent. There are situations
+ * however where the engine's board is already current. This
+ * will happen in the following situations:
+ * (1) The engine has been sent a movelist by ProcessMoveList().
+ * (2) We are not using a movelist and we are at the
+ * first board. This is even true in a shuffle or adjourned game 
+ * since in that case ProcessBoard() will have already sent the 
+ * initial board to the engine.
+ *
+ * In such cases HandleBoard should be called with the flag 
+ * engineBoardIsCurrent=TRUE.
+ * 
+ * If the current position has a book move then HandleBoard will
+ * "play" it (send it to the ICS). Otherwise it will put the engine 
+ * in the thinking state (if necessary) by calling
+ * ensureEngineIsThinking().
+ *
+ ****************************************************************/
+
+void HandleBoard(IcsBoard * icsBoard, Bool engineBoardIsCurrent){
   move_t move;
   book_move_t bmove;
   int whitetime,blacktime;
@@ -599,60 +714,62 @@ void HandleBoard(IcsBoard * icsBoard, char *moveList, Bool ignoreMove){
       create_timer(&(runData.flagTimer),(flagtime+1)*1000,Flag,NULL);
     }
   }
-  if(moveList){
-    Force();
-    SendMovesToComputer(moveList);
-  }
   if(EngineToMove(icsBoard)){
-    /* clear outstanding flag and abort alarms */
-    CancelTimers();
-    whitetime=100*icsBoard->whitetime;
-    blacktime=100*icsBoard->blacktime;
-    SendTimeToComputer(whitetime, blacktime);
-    book_move(icsBoard,&bmove,TRUE);
-    if(strcmp(bmove.move,"none")){
-      Force();
-    }
-    if (runData.longAlgMoves) {
-      strcpy(move, icsBoard->lanMove);
-    } else {
-      strcpy(move, icsBoard->sanMove);
-    }
-    if(strcmp(move,"none") && !moveList && !ignoreMove){
-      logme(LOG_INFO, "Move from ICS: %s %s", 
-                     icsBoard->lanMove,icsBoard->sanMove);
-      SendMoveToComputer(move);
-    }
-    runData.waitingForFirstBoard=FALSE;
-    if(strcmp(bmove.move,"none")){
-      logme(LOG_INFO,"Bookmove: %s score=%d\n",bmove.move,bmove.score);
-      if(appData.feedback && appData.feedbackCommand){
-	  SendToIcs("%s Bookmove: %s score=%d\n",appData.feedbackCommand,bmove.move,bmove.score); 
+      if(runData.nextMoveNum==icsBoard->nextMoveNum){
+         logme(LOG_DEBUG,"Ignoring board since we already saw one with this move number.");
+      }else{
+	  /* update state */
+	  runData.nextMoveNum=icsBoard->nextMoveNum;
+		    /* clear outstanding flag and abort alarms */
+	  CancelTimers();
+	  whitetime=100*icsBoard->whitetime;
+	  blacktime=100*icsBoard->blacktime;
+	  SendTimeToComputer(whitetime, blacktime);
+	  book_move(icsBoard,&bmove,TRUE);
+	  if(strcmp(bmove.move,"none")){
+	      Force();
+	  }
+	  if (runData.longAlgMoves) {
+	      strcpy(move, icsBoard->lanMove);
+	  } else {
+	      strcpy(move, icsBoard->sanMove);
+	  }
+	  if(strcmp(move,"none") && !engineBoardIsCurrent){
+	      logme(LOG_INFO, "Move from ICS: %s %s", 
+		    icsBoard->lanMove,icsBoard->sanMove);
+	      SendMoveToComputer(move);
+	  }
+	  runData.waitingForFirstBoard=FALSE;
+	  if(strcmp(bmove.move,"none")){
+	      logme(LOG_INFO,"Bookmove: %s score=%d\n",bmove.move,bmove.score);
+	      if(appData.feedback && appData.feedbackCommand){
+		  SendToIcs("%s Bookmove: %s score=%d\n",appData.feedbackCommand,bmove.move,bmove.score); 
+	      }
+	      if(appData.proxyFeedback){
+		  Feedback(PROXY,"--> icsdrone: Bookmove: %s score=%d",bmove.move,bmove.score); 
+	      }
+	      SendToIcs("%s\n",bmove.move);
+	      SendMoveToComputer(bmove.move);
+	  }else{
+	      ensureEngineIsThinking();
+	  }
       }
-      if(appData.proxyFeedback){
-	  Feedback(PROXY,"--> icsdrone: Bookmove: %s score=%d",bmove.move,bmove.score); 
-      }
-      SendToIcs("%s\n",bmove.move);
-      SendMoveToComputer(bmove.move);
-    }else{
-      Go();
-    }
   }
 }
 
-void SetupEngineOptions(IcsBoard *icsBoard){
-  /* 
-   *  Setup chessprogram with the right options.
-   *  I think I finally got this right
-   */
+void SetupEngine(){
   EnsureComputerReady();
-  if (!appData.secPerMove && !appData.searchDepth) {
-    Level(icsBoard->basetime,icsBoard->inctime);
-  } 
   SecondsPerMove(appData.secPerMove);
   Depth(appData.searchDepth);
   Easy(appData.easyMode);
   Random();
+
+}
+
+void SetupLevel(int time, int inc){
+  if (!appData.secPerMove && !appData.searchDepth) {
+    Level(time,inc);
+  } 
 }
 
 char * KillPrompts(char *line){
@@ -693,7 +810,7 @@ Bool ProcessForwardingMarkers(char *line){
   if(IsMarker(STARTFORWARDING,line)){
     logme(LOG_DEBUG,"Starting forwarding.");
     runData.forwarding=1;
-    StartMultiFeedback(runData.forwardingMask);
+    StartMultiFeedback(runData.forwardingMask&~PROXY);
     forwardingDepth++;
     return TRUE;
   }
@@ -703,7 +820,7 @@ Bool ProcessForwardingMarkers(char *line){
       logme(LOG_DEBUG,"Stopping forwarding.");
       runData.forwarding=0;
       runData.inhibitPrompt=FALSE;    /* not nice hack */
-      StopMultiFeedback(runData.forwardingMask);
+      StopMultiFeedback(runData.forwardingMask&~PROXY);
     }
     return TRUE;
   }
@@ -729,10 +846,32 @@ Bool IsShuffle(char *chessvariant){
     return TRUE;
 }
 
-Bool IsFicsShuffle(char *icsvariant){
+Bool IsIcsShuffle(char *icsvariant){
+    if(!strncmp(icsvariant,"wild(17)",7) && runData.icsType==ICS_ICC){
+	/* losers on ICC */
+	return FALSE;
+    }
+    if(!strncmp(icsvariant,"wild(23)",7) && runData.icsType==ICS_ICC){
+	/* crazyhouse on ICC */
+	return FALSE;
+    }
+    if(!strncmp(icsvariant,"wild(25)",7) && runData.icsType==ICS_ICC){
+	/* 3check on ICC */
+	return FALSE;
+    }
+    if(!strncmp(icsvariant,"wild(26)",7) && runData.icsType==ICS_ICC){
+	/* giveaway on ICC */
+	return FALSE;
+    }
+    if(!strncmp(icsvariant,"wild(27)",7) && runData.icsType==ICS_ICC){
+	/* atomic on ICC */
+	return FALSE;
+    }
     if(!strncmp(icsvariant,"wild",4)){
+	/* generic */
 	return TRUE;
     }
+    /* The following are specific for FICS */
     if(!strncmp(icsvariant,"odds",4)){
 	return TRUE;
     }
@@ -754,19 +893,45 @@ Bool IsFicsShuffle(char *icsvariant){
     return FALSE;
 }
 
+Bool MovelistHasPosition(){
+    switch(runData.icsType){
+    case ICS_FICS: 
+	return TRUE;
+    case ICS_ICC:
+	return TRUE;
+    default:
+	return FALSE;
+    }
+}
 
+/********************************************************
+ * There is only a single situation in which asking for
+ * a movelist is advantageous. Namely when resuming an
+ * adjourned game in order to catch 3-fold repetition and 
+ * 50 move draws.
+ * Yet, since handling movelists is tricky, we use them as
+ * often as we can, even if it provides no benefit, in 
+ * order to increase the likelihood of triggering 
+ * potential bugs.
+ * There is a single situation in which we _cannot_ use
+ * a movelist. This is when the game has a nonstandard 
+ * starting position and the ICS does not send the starting 
+ * position as part of the movelist.
+ ********************************************************/
 Bool UseMoveList(){
     int ret;
     ret=TRUE;
-    if (runData.longAlgMoves && runData.icsType!=ICS_FICS) {
+    if (!appData.engineKnowsSAN && runData.longAlgMoves && runData.icsType!=ICS_FICS) {
 	/* only FICS has the (undocumented) command "moves l" */
-	logme(LOG_WARNING,"Server doesn't support long algebraic move lists.\n\
+	logme(LOG_WARNING,"The engine did not specify san=1.\n\
+The server does not support long algebraic move lists\n\
+and the option engineKnowsSAN is false.\n\
 Do not ask for movelist.\n");
 	ret=FALSE;
-    }else if(IsFicsShuffle(runData.icsVariant)){
-	/* Getting the initial position in a shuffle game is tricky */
-	/* For now ignore this problem */
-	logme(LOG_DEBUG,"Do not ask for movelist since this is a shuffle game.\n");
+    }else if(IsIcsShuffle(runData.icsVariant) && !MovelistHasPosition()){
+	logme(LOG_DEBUG,"Do not ask for movelist since this is a shuffle game\n"
+	                 "and the Ics does not send the starting position as.\n"
+	                 "part of the movelist.\n");
 	ret=FALSE;
     }
     return ret;
@@ -871,6 +1036,8 @@ Bool ProcessLogin(char *line){
    */
   char name[30+1];
   char dummy;
+  value_t value[1];
+  char *command;
   if(runData.loggedIn) return FALSE;
   if (strstr(line,"Invalid password")){
     ExitOn(EXIT_HARDQUIT,"Invalid password!");
@@ -919,11 +1086,12 @@ Bool ProcessLogin(char *line){
 	char *variants;
 	switch(runData.icsType){
 	case ICS_FICS:
-	    variants="lightning,blitz,standard,wild/0=wildcastle,wild/1=wildcastle,wild/fr=fischerandom,wild=nocastle,suicide=suicide,losers=losers,atomic=atomic,crazyhouse=crazyhouse,odds,eco,nic,uwild=nocastle,pawns,misc";
+	    variants="lightning,blitz,standard,wild/0=wildcastle,wild/1=wildcastle,wild/8,wild/8a,wild/fr=fischerandom,wild=nocastle,suicide=suicide,losers=losers,atomic=atomic,crazyhouse=crazyhouse,odds,eco,nic,uwild=nocastle,pawns,misc";
 	    break;
 	case ICS_ICC:
 	    /* This is currently not tested! */
-	    variants="Bullet,Blitz,Standard,wild/1=wildcastle,wild/2,wild/3,wild/4,wild/5,wild/7,wild/8,wild/9=twokings,wild/10,wild/11,wild/12,wild/13,wild/14,wild/15,wild/16=kriegspiel,wild/17,wild/18,wild/19,wild/22=fischerandom,wild/23=crazyhouse,wild/25=3check,wild/26=giveaway,wild/27=atomic,wild/28=shatranj";
+	    /* wild/24=bughouse */
+	    variants="Bullet,Blitz,Standard,wild(1)=wildcastle,wild(2),wild(3),wild(4),wild(5),wild(7),wild(8),wild(9)=twokings,wild(10),wild(11),wild(12),wild(13),wild(14),wild(15),wild(16)=kriegspiel,wild(17)=losers,wild(18),wild(19),wild(22)=fischerandom,wild(23)=crazyhouse,wild(25)=3check,wild(26)=giveaway,wild(27)=atomic,wild(28)=shatranj";
 	    SetOption("variants",LOGIN,0,variants);
 	    logme(LOG_DEBUG,"Enabling variants: %s",variants);
 	    break;
@@ -970,6 +1138,26 @@ Bool ProcessLogin(char *line){
         ExecCommandList(appData.sendLogin,0,FALSE);
     }
     SendToIcs("resume\n");
+    // injecting in interpreter
+    eval_set("sys.handle",V_STRING,SY_RO,runData.handle);
+    eval_set("sys.registered",V_BOOLEAN,SY_RO,runData.registered);
+    switch(runData.icsType){
+    case ICS_FICS:
+	eval_set("sys.ics_type",V_STRING,SY_RO,"fics");
+	break;
+    case ICS_ICC:
+	eval_set("sys.ics_type",V_STRING,SY_RO,"ics");
+	break;
+    case ICS_VARIANT:
+	eval_set("sys.ics_type",V_STRING,SY_RO,"variant");
+	break;
+    default:
+	eval_set("sys.ics_type",V_STRING,SY_RO,"generic");
+	break;
+
+    }
+    command="log(\"sys.handle=\"+str(sys.handle)+\" sys.registered=\"+str(sys.registered)+\" sys.ics_type=\"+str(sys.ics_type))";
+    eval(value,command);
     return TRUE;
   }
   if(!runData.loggedIn && (
@@ -1101,11 +1289,19 @@ Bool ProcessOffers(char *line){
          */
     return TRUE;
   }
+  if(sscanf(line, "%30s would like to adjourn the game%c", name, &dummy) == 2) {
       /*
-       * Add an option here to accept adjourn offers automatically.
        * The new FICS adjucation system makes adjudication very efficient.
        * So stored games are no longer a problem. 
        */
+      if(appData.acceptAdjourn){
+	  SendToIcs("adjourn\n");
+	  Feedback(mask,"Game with %s adjourned.",name);
+      }else{
+	  SendToIcs("say Sorry this computer does not accept adjourns.\n");
+      }
+      return TRUE;
+  }
   return FALSE;
 }
 
@@ -1185,6 +1381,11 @@ Bool ProcessTells(char *line){
 	ProcessTourneyNotifications(tmp);
       }
     } else{
+      if(appData.console){
+#ifdef HAVE_LIBREADLINE
+	rl_ding();
+#endif
+      }
       SetFeedbackColor(appData.colorTell);
       Feedback(CONSOLE|OWNER|SHORTLOG,"%s: %s",name,tmp);
       UnsetFeedbackColor();
@@ -1208,7 +1409,11 @@ Bool ProcessNotifications(char *line){
    *  Remind a player of an unfinished game...
    */
   if (sscanf(line, "Notification: %30s who has an adjourned game%c", 
-	     name, &dummy) == 2) {
+	     name, &dummy) == 2 ||
+      sscanf(line, "Notification: %30s (with whom you have an adjourned game)"
+	     " has arrived%c", 
+	     name, &dummy) == 2
+      ) {
     name[strlen(name)-1] = '\0';
     SendToIcs("match %s\ntell %s Hi %s.  Let's finish our adjourned game, please.\n", name, name, name);
     return TRUE;
@@ -1216,30 +1421,164 @@ Bool ProcessNotifications(char *line){
   return FALSE;
 }
 
+void InjectChallenge(char *name, 
+		     char *rating, 
+		     int has_color, 
+		     char *color, 
+		     char *name2, 
+		     char *rating2, 
+		     char *rated, 
+		     char *variant,
+		     char *time_, 
+		     char *inc,
+		     int win,
+		     int draw,
+		     int loss,
+		     int computer){
+    char *command;
+    value_t value[1];
+    // Inject in interpreter
+    eval_set("co.name",V_STRING,SY_RO,name);
+    eval_set("co.rating",V_NUMERIC,SY_RO,atoi(rating));
+    if(!strncmp(rating,"----",4)){
+	eval_set("co.registered",V_BOOLEAN,SY_RO,0);
+    }else{
+	eval_set("co.registered",V_BOOLEAN,SY_RO,1);
+    }
+    eval_set("co.myrating",V_NUMERIC,SY_RO,atoi(rating2));
+    if(atoi(rating)!=0 && atoi(rating2)!=0){
+	eval_set("co.ratingdiff",V_NUMERIC,SY_RO,atoi(rating)-atoi(rating2));
+    }else{
+	eval_set("co.ratingdiff",V_NUMERIC,SY_RO,0);
+    }
+    if(!strcmp(rated,"rated")){
+	eval_set("co.rated",V_BOOLEAN,SY_RO,1);
+	eval_set("co.unrated",V_BOOLEAN,SY_RO,0);
+    }else{
+	eval_set("co.rated",V_BOOLEAN,SY_RO,0);
+	eval_set("co.unrated",V_BOOLEAN,SY_RO,1);
+    }
+    eval_set("co.variant",V_STRING,SY_RO,variant);
+    
+    eval_set("co.white",V_BOOLEAN,SY_RO,0);
+    eval_set("co.black",V_BOOLEAN,SY_RO,0);
+    eval_set("co.nocolor",V_BOOLEAN,SY_RO,0);
+    if(has_color){
+	eval_set("co.color",V_STRING,SY_RO,color);
+	if(!strcasecmp(color,"white")){
+	    eval_set("co.white",V_BOOLEAN,SY_RO,1);
+	}else{
+	    eval_set("co.black",V_BOOLEAN,SY_RO,1);
+	}
+    }else{
+	eval_set("co.color",V_NONE,SY_RO);
+	eval_set("co.nocolor",V_BOOLEAN,SY_RO,1);
+    }
+    eval_set("co.time",V_NUMERIC,SY_RO,atoi(time_));
+    eval_set("co.inc",V_NUMERIC,SY_RO,atoi(inc));
+    eval_set("co.etime",V_NUMERIC,SY_RO,60*atoi(time_)+40*atoi(inc));
+
+    eval_set("co.assesswin",V_NUMERIC,SY_RO,win);
+    eval_set("co.assessdraw",V_NUMERIC,SY_RO,draw);
+    eval_set("co.assessloss",V_NUMERIC,SY_RO,loss);
+    eval_set("co.computer",V_BOOLEAN,SY_RO,computer);
+
+    eval_set("co.lightning",V_BOOLEAN,SY_RO,0);
+    eval_set("co.blitz",V_BOOLEAN,SY_RO,0);
+    eval_set("co.standard",V_BOOLEAN,SY_RO,0);
+    eval_set("co.chess",V_BOOLEAN,SY_RO,0);
+    eval_set("co.atomic",V_BOOLEAN,SY_RO,0);
+    eval_set("co.suicide",V_BOOLEAN,SY_RO,0);
+    eval_set("co.losers",V_BOOLEAN,SY_RO,0);
+    eval_set("co.crazyhouse",V_BOOLEAN,SY_RO,0);
+    eval_set("co.wild",V_BOOLEAN,SY_RO,0);
+
+    if(FALSE){
+    }else if(!strcasecmp(variant,"losers")){
+	eval_set("co.losers",V_BOOLEAN,SY_RO,1);
+    }else if(!strcasecmp(variant,"suicide")){
+	eval_set("co.suicide",V_BOOLEAN,SY_RO,1);
+    }else if(!strcasecmp(variant,"atom")){
+	eval_set("co.atomic",V_BOOLEAN,SY_RO,1);
+    }else if(!strcasecmp(variant,"crazyhouse")){
+	eval_set("co.crazyhouse",V_BOOLEAN,SY_RO,1);
+    }else if(!strncmp(variant,"wild",4)){
+	eval_set("co.wild",V_BOOLEAN,SY_RO,1);
+    }else if(!strcasecmp(variant,"lightning")){
+	eval_set("co.lightning",V_BOOLEAN,SY_RO,1);
+	eval_set("co.chess",V_BOOLEAN,SY_RO,1);
+    }else if(!strcasecmp(variant,"blitz")){
+	eval_set("co.blitz",V_BOOLEAN,SY_RO,1);
+	eval_set("co.chess",V_BOOLEAN,SY_RO,1);
+    }else if(!strcasecmp(variant,"standard")){
+	eval_set("co.standard",V_BOOLEAN,SY_RO,1);
+	eval_set("co.chess",V_BOOLEAN,SY_RO,1);
+    }
+
+    command="log(\"co.name=\"+str(co.name)+\" co.rating=\"+str(co.rating)+\" co.myrating=\"+str(co.myrating)+\" co.ratingdiff=\"+str(co.ratingdiff)+\" co.registered=\"+str(co.registered)+\" co.rated=\"+str(co.rated)+\" co.unrated=\"+str(co.unrated)+\" co.variant=\"+str(co.variant)+\" co.color=\"+str(co.color)+\" co.nocolor=\"+str(co.nocolor)+\" co.time=\"+str(co.time)+\" co.inc=\"+str(co.inc)+\" co.etime=\"+str(co.etime)+\" co.white=\"+str(co.white)+\" co.black=\"+str(co.black))";
+    eval(value,command);
+   command="log(\"co.lightning=\"+str(co.lightning)+\" co.blitz=\"+str(co.blitz)+\" co.standard=\"+str(co.standard)+\" co.chess=\"+str(co.chess)+\" co.atomic=\"+str(co.atomic)+\" co.suicide=\"+str(co.suicide)+\" co.losers=\"+str(co.losers)+\" co.crazyhouse=\"+str(co.crazyhouse)+\" co.wild=\"+str(co.wild))";
+    eval(value,command);
+    command="log(\"co.assesswin=\"+str(co.assesswin)+\" co.assessdraw=\"+str(co.assessdraw)+\" co.assessloss=\"+str(co.assessloss)+\" co.computer=\"+str(co.computer))";
+    eval(value,command);
+}
+
 Bool ProcessIncomingMatches(char *line){
-  char name[30+1];
-  char name2[30+1];
-  char rating[30+1];
-  char rating2[30+1];
-  char rated[30+1];
-  char variant[30+1];
-  char color[30+1];
+  static char name[30+1];
+  static char name2[30+1];
+  static char rating[30+1];
+  static char rating2[30+1];
+  static char rated[30+1];
+  static char variant[30+1];
+  static char color[30+1];
+  static char time_[30+1];
+  static char inc[30+1];
+  static int has_color=FALSE;
+  static int win;
+  static int draw;
+  static int loss;
+  static int computer;
+  static int parsingIncoming=FALSE; 
+  char *line1;
+  int ret;
+  value_t value[1];
+
   if(!runData.loggedIn) return FALSE;
+
+  if(!parsingIncoming){
+      has_color=FALSE;
+      win=0;
+      draw=0;
+      loss=0;
+      computer=FALSE;
+  }
   /*
    *  Accept incoming matches
    */
-  if ((sscanf(line, "Challenge: %30s (%30[^)])%30s (%30[^)])%30s%30s", 
-	      name,rating,name2,rating2,rated,variant) == 6)
+
+
+  /* ALERT:
+     This is somewhat broken on ICC for the variant Chess960 because it contains digits:-(
+     The variables time_, inc will have the wrong value. This will be corrected when the match is created. 
+     Unless you use the undocumented matchfilter variable and use these wrong values to decline
+     prematurely .... */
+
+  if ((sscanf(line, "Challenge: %30s (%30[^)]) %30s (%30[^)]) %30s %30s%*[^0-9]%30s %30s", 
+	      name,rating,name2,rating2,rated,variant,time_,inc) == 8)
       ||
-      (sscanf(line,"Challenge: %30s (%30[^)]) [%30[^]]] %30s (%30[^)])%30s%30s",
-              name,rating,color,name2,rating2,rated,variant)==7)){
+      (has_color=(sscanf(line,"Challenge: %30s (%30[^)]) [%30[^]]] %30s (%30[^)]) %30s %30s%*[^0-9]%30s %30s",
+			 name,rating,color,name2,rating2,rated,variant,time_,inc)==9))){
+      logme(LOG_DEBUG, "Detected challenge: [%s] (%s) vs [%s] (%s) [%s] [%s] %s %s", 
+	 name, rating, name2, rating2,rated,variant,time_,inc);
       int i;
+      parsingIncoming=TRUE;
       /* More specific variant */
       char *line1;
       int found;
       if((line1=strstr(line,"Loaded"))){
 	  sscanf(line1,"Loaded from %30[^. ]",variant);
       }
+
       found=FALSE;
       for(i=0;i<runData.icsVariantCount;i++){
 	  if(IsVariant(variant,runData.icsVariants[i][0])){
@@ -1257,12 +1596,14 @@ Bool ProcessIncomingMatches(char *line){
       if(!found){
 	  SendToIcs("tell %s Sorry I do not play variant \"%s\".\n",name,variant);
 	  SendToIcs("decline %s\n",name);
+	  parsingIncoming=FALSE;
 	  return TRUE;
       }
 
     if(!runData.inTourney && IsNoPlay(name)){
         logme(LOG_DEBUG,"Ignoring %s as he is on our noplay list.",name);
         SendToIcs("decline %s\n",name);
+	parsingIncoming=FALSE;
         return TRUE;
     }
     //    if(runData.inTourney && strcmp(runData.tournamentOppName,name)){
@@ -1273,12 +1614,20 @@ Bool ProcessIncomingMatches(char *line){
     if (appData.acceptOnly && strcasecmp(name,appData.acceptOnly)){
       SendToIcs("tell %s Sorry I am busy right now.\n",name);
       SendToIcs("decline %s\n", name);
+      parsingIncoming=FALSE;
       return TRUE;
     }
 
     if (runData.quitPending) {
       SendToIcs("tell %s Sorry I have to go.\n", name);
       SendToIcs("decline %s\n", name);
+      parsingIncoming=FALSE;
+      return TRUE;
+    }
+    if(strstr(line,"adjourned")){
+      logme(LOG_DEBUG, "Our opponent is trying to resume a game. Accept unconditionally!");	
+      parsingIncoming=FALSE;
+      SendToIcs("accept %s\n", name);
       return TRUE;
     }
     if (!runData.inTourney && appData.hardLimit && 
@@ -1287,6 +1636,7 @@ Bool ProcessIncomingMatches(char *line){
       logme(LOG_DEBUG,"Hard limit reached with %s.",name);
       SendToIcs("tell %s You have played me %d times in a row;  I need to take a rest.\n", name, runData.numGamesInSeries);
       SendToIcs("decline %s\n", name);
+      parsingIncoming=FALSE;
       return TRUE;
     }
     if (!runData.inTourney && appData.limitRematches &&
@@ -1296,11 +1646,79 @@ Bool ProcessIncomingMatches(char *line){
       SendToIcs("tell %s You have played me %d times in a row;  I'll wait a minute for other players to get a chance to challenge me before I accept your challenge.\n", name, runData.numGamesInSeries);
       CancelTimers();
       create_timer(&(runData.findChallengeTimer),FINDCHALLENGETIMEOUT,FindChallenge,NULL);
+      parsingIncoming=FALSE;
       return TRUE;
     } 
-    SendToIcs("accept %s\n", name);
+
+
+
     return TRUE;
-}
+  }
+  if(parsingIncoming){
+      switch(runData.icsType){
+      case ICS_ICC:
+	  line1=strstr(line,"Loss");
+	  if(line1 && sscanf(line1,"Loss: %d%*[, ]Draw: %d%*[, ]Win: %d",
+			     &loss,&draw,&win)==3){
+	      return TRUE;
+	  }
+      default:
+	  line1=strstr(line,"Win");
+	  if(line1 && sscanf(line1,"Win: %d%*[, ]Draw: %d%*[, ]Loss: %d",
+			     &win,&draw,&loss)==3){
+	      return TRUE;
+	  }
+      }
+      if(strstr(line,"computer")){
+	  computer=TRUE;
+          runData.computerOpponent=TRUE;
+	  return TRUE;
+      }
+      if(strstr(line,"Creating:")){
+	  parsingIncoming=FALSE;
+	  return FALSE; 
+	  /* will be passed on to ProcessStartOfGame() */
+	  /* This is admittedly hacky and fragile */
+      }
+      if(strstr(line,"accept") && strstr(line,"decline")){
+	  parsingIncoming=FALSE;
+
+	  if(!runData.inTourney && appData.matchFilter){
+	      InjectChallenge(name, 
+			      rating, 
+			      has_color, 
+			      color, 
+			      name2, 
+			      rating2, 
+			      rated,
+			      variant,
+			      time_, 
+			      inc,
+			      win,
+			      draw,
+			      loss,
+			      runData.computerOpponent);
+	      logme(LOG_DEBUG,"Executing matchFilter command: \"%s\"",appData.matchFilter);
+	      ret=eval(value,"%s",appData.matchFilter);
+	      logme(LOG_DEBUG,"Error code=%d\n",ret);
+	      if(!ret){
+		  if(value->type!=V_BOOLEAN){
+		      logme(LOG_ERROR,"matchFilter does not return a boolean value...");
+		  }else{
+		      logme(LOG_DEBUG,"Return value=%s\n",value->value?"true":"false");
+		      if(!value->value){
+			  logme(LOG_DEBUG,"Rejecting match as matchFilter=false\n");
+			  SendToIcs("decline %s",name);
+			  return TRUE;
+		      }
+		  }
+	      }
+	  }
+	  SendToIcs("accept %s\n", name);
+	  return TRUE;
+      }
+  }
+
   return FALSE;
 }
 
@@ -1348,6 +1766,139 @@ Bool ProcessStandings(char *line){
     return FALSE;
  }
 
+void InjectCurrentTourney(char *TM, char* type){
+    value_t value[1];
+    char *token;
+    int inc;
+    int time_;
+    int etime;
+    /* inject things in interpreter */
+    //eval_debug=1;
+
+    token=strtok(TM," ");
+    eval_set("ct.tm",V_STRING,SY_RO,token);
+
+    token=strtok(type," (\\)");
+    eval_set("ct.time",V_NUMERIC,SY_RO,time_=atoi(token));
+
+    token=strtok(NULL," (\\)");
+    eval_set("ct.inc",V_NUMERIC,SY_RO,inc=atoi(token));
+
+    // compute a dependent variable
+    etime=60*time_+40*inc;
+    eval_set("ct.etime",V_NUMERIC,SY_RO,etime);
+
+    token=strtok(NULL," (\\)");
+    if(!strcmp(token,"r")){
+	eval_set("ct.rated",V_BOOLEAN,SY_RO,1);
+    }else{
+	eval_set("ct.rated",V_BOOLEAN,SY_RO,0);
+    }
+
+    eval_set("ct.lightning",V_BOOLEAN,SY_RO,0);
+    eval_set("ct.blitz",V_BOOLEAN,SY_RO,0);
+    eval_set("ct.standard",V_BOOLEAN,SY_RO,0);
+    eval_set("ct.chess",V_BOOLEAN,SY_RO,0);
+    eval_set("ct.atomic",V_BOOLEAN,SY_RO,0);
+    eval_set("ct.suicide",V_BOOLEAN,SY_RO,0);
+    eval_set("ct.losers",V_BOOLEAN,SY_RO,0);
+    eval_set("ct.crazyhouse",V_BOOLEAN,SY_RO,0);
+    eval_set("ct.wild",V_BOOLEAN,SY_RO,0);
+
+    token=strtok(NULL," (\\)");
+    if(!strcmp(token,"wild") || !strcmp(token,"los") || !strcmp(token,"sui") 
+       || !strcmp(token,"atom") || !strcmp(token,"zh")){
+	logme(LOG_DEBUG,"This is a variant tourney.");
+	if(!strcmp(token,"los")){
+	    eval_set("ct.variant",V_STRING,SY_RO,"losers");
+	    eval_set("ct.losers",V_BOOLEAN,SY_RO,1);
+	}else if(!strcmp(token,"sui")){
+	    eval_set("ct.variant",V_STRING,SY_RO,"suicide");
+	    eval_set("ct.suicide",V_BOOLEAN,SY_RO,1);
+	}else if(!strcmp(token,"atom")){
+	    eval_set("ct.variant",V_STRING,SY_RO,"atomic");
+	    eval_set("ct.atomic",V_BOOLEAN,SY_RO,1);
+	}else if(!strcmp(token,"zh")){
+	    eval_set("ct.variant",V_STRING,SY_RO,"crazyhouse");
+	    eval_set("ct.crazyhouse",V_BOOLEAN,SY_RO,1);
+	}else if(!strcmp(token,"wild")){
+	    char buffer[256];
+	    int i;
+	    // wild needs special treatment
+	    token=strtok(NULL," ");
+	    snprintf(buffer,255,"wild/%s",token);
+	    buffer[255]='\0';
+	    for(i=0;i<strlen(buffer);i++){
+		if(isupper(buffer[i])){
+		    buffer[i]=tolower(buffer[i]);
+		}
+	    }
+	    eval_set("ct.variant",V_STRING,SY_RO,buffer);
+	    eval_set("ct.wild",V_BOOLEAN,SY_RO,1);
+	}
+	token=strtok(NULL," (\\)");
+    }else{
+	eval_set("ct.chess",V_BOOLEAN,SY_RO,1);
+	if(etime<180){
+	    eval_set("ct.variant",V_STRING,SY_RO,"lightning");
+	    eval_set("ct.lightning",V_BOOLEAN,SY_RO,1);
+	}else if(etime<900){
+	    eval_set("ct.variant",V_STRING,SY_RO,"blitz");
+	    eval_set("ct.blitz",V_BOOLEAN,SY_RO,1);
+	}else{
+	    eval_set("ct.variant",V_STRING,SY_RO,"standard");
+	    eval_set("ct.standard",V_BOOLEAN,SY_RO,1);
+	}
+    }
+    eval_set("ct.type",V_STRING,SY_RO,token);
+
+    if(!(!strcasecmp(token,"drr") || !strcasecmp(token,"rr"))){
+	// non RR or DDR have rounds
+	token=strtok(NULL," (\\)");
+	if(token){
+	    eval_set("ct.rounds",V_NUMERIC,SY_RO,atoi(token));
+	}else{
+	    eval_set("ct.rounds",V_NUMERIC,SY_RO,0);
+	}
+    }else{
+	eval_set("ct.rounds",V_NUMERIC,SY_RO,0);
+    }
+
+    char *command="log(\"ct.tm=\"+str(ct.tm)+\" ct.time=\"+str(ct.time)+\" ct.inc=\"+str(ct.inc)+\" ct.etime=\"+str(ct.etime)+\" ct.rated=\"+str(ct.rated)+\" ct.variant=\"+str(ct.variant)+\" ct.type=\"+str(ct.type)+\" ct.rounds=\"+str(ct.rounds))";
+    char *command1="log(\"ct.lightning=\"+str(ct.lightning)+\" ct.blitz=\"+str(ct.blitz)+\" ct.standard=\"+str(ct.standard)+\" ct.chess=\"+str(ct.chess)+\" ct.atomic=\"+str(ct.atomic)+\" ct.suicide=\"+str(ct.suicide)+\" ct.losers=\"+str(ct.losers)+\" ct.crazyhouse=\"+str(ct.crazyhouse)+\" ct.wild=\"+str(ct.wild))";
+
+    eval(value,"%s",command);
+    eval(value,"%s",command1);
+}
+
+Bool ProcessICCTourneyGameStart(char *line){
+    /* 
+     * This based on a patch by Marcel van Kervinck. Its natural place
+     * would be at the end of ProcessTourneyNotifications() (which treats
+     * the matches).
+     * But it is not clear to me that any of FICS tourney logic works on ICC.
+     * In particular I think the runData.inTourney flag is not set on ICC.
+     * Therefore for safety we treat this separately until further notice.
+     */
+    char name[30+1];
+    if(!runData.loggedIn) return FALSE;
+    /*
+     *  On ICC the players must create the match themselves.
+     *  The Automato tournament software doesn't do that, unlike mamer on FICS.
+     *  A new round looks like:
+     *    tourney set to "Automato AWCRCC * Goldbar 25 4 25 4 u w0 black 6" by Automato.
+     *  And the needed response is then:
+     *    match Goldbar!
+     *  The server knows the parameters such as color and time control.
+     */
+    if (sscanf(line, "tourney set to %*[^*]* %30s", name) == 1) {
+	SendToIcs("match %s!\n", name);
+	runData.lastGameWasInTourney++; // mainly to avoid 'rematch'
+	return TRUE;
+    }
+    return FALSE;
+}
+
 Bool ProcessTourneyNotifications(char *line){
   int tournamentId;
   Bool endOfTournament=FALSE;
@@ -1360,6 +1911,12 @@ Bool ProcessTourneyNotifications(char *line){
   char date[30+1];
   char color[30+1];
   char name[30+1];
+  value_t value[1];
+  int ret;
+
+  if(runData.icsType!=ICS_FICS){
+      return FALSE;
+  }
 
   if(hideFromProxy){
       runData.hideFromProxy=TRUE;
@@ -1488,13 +2045,27 @@ Bool ProcessTourneyNotifications(char *line){
       logme(LOG_DEBUG,"Not joining tourney since we are already in a tourney.");
       return TRUE;
     }
-    if(strstr(type,"wild") || strstr(type,"los") || strstr(type,"sui") 
-       || strstr(type,"atom") || strstr(type,"zh") || strstr(type,"cra")){
-      logme(LOG_DEBUG,"Not joining tourney since it is a nonstandard variant.");
-      return TRUE;
+    if(appData.tourneyFilter){
+	InjectCurrentTourney(TM,type);
+	logme(LOG_DEBUG,"Executing tourneyFilter command: \"%s\"",appData.tourneyFilter);
+	ret=eval(value,"%s",appData.tourneyFilter);
+	logme(LOG_DEBUG,"Error code=%d\n",ret);
+	if(!ret){
+	    if(value->type!=V_BOOLEAN){
+		logme(LOG_ERROR,"tourneyFilter does not return a boolean value...");
+	    }else{
+		logme(LOG_DEBUG,"Return value=%s\n",value->value?"true":"false");
+		if(value->value){
+		    logme(LOG_DEBUG,"Trying to join tourney %d\n",tournamentId);
+		    SendToIcs("td join %d\n",tournamentId);
+		}else{
+		    logme(LOG_DEBUG,"Not joining tourney as tourneyFilter=false\n");
+		}
+	    }
+	}
+    }else{
+	logme(LOG_DEBUG,"No tourneyFilter command.");	
     }
-    logme(LOG_DEBUG,"Trying to join tourney %d\n",tournamentId);
-    SendToIcs("td join %d\n",tournamentId);
     return TRUE;
   }
   
@@ -1534,40 +2105,89 @@ Bool ProcessFlaggedOpponent(char *line){
   return FALSE;
 }
 
+Bool ParseCreating(char *line,
+		   char *name, 
+		   char *rating, 
+		   char *name2, 
+		   char *rating2, 
+		   char *rated, 
+		   char *icsVariant, 
+		   int *time, 
+		   int *inc){
+    Bool ret;
+    char color[30+1];
+    char *line_;
+    char *frc;
+    ret=FALSE;
+    color[0]='\0';
+    *time=0;
+    *inc=0;
+    line_=strdup(line);
+    /* Terrible hack. The digits in Chess960 mess up the sscanf parsing below. */
+    if((frc=strstr(line_,"Chess960"))){
+	frc[5]='F';
+	frc[6]='R';
+	frc[7]='C';
+    }
+    if ((sscanf(line_, 
+		"Creating: %30s (%30[^)]) %30s (%30[^)]) %30s %30s%*[^0-9]%d %d", 
+		name, 
+		rating, 
+		name2, 
+		rating2, 
+		rated, 
+		icsVariant, 
+		time, 
+		inc) == 8)
+	|| (sscanf(line_, 
+		   "Creating: %30s (%30[^)]) [%30[^]]] %30s (%30[^)]) %30s %30s%*[^0-9]%d %d", 
+		   name, 
+		   rating, 
+		   color, 
+		   name2, 
+		   rating2, 
+		   rated, 
+		   icsVariant, 
+		   time, 
+		   inc) == 9)
+	){
+	ret=TRUE;
+    }
+    name[30]='\0';
+    rating[30]='\0';
+    color[30]='\0';
+    name2[30]='\0';
+    rating2[30]='\0';
+    rated[30]='\0';
+    icsVariant[30]='\0';
+    free(line_);
+    return ret;
+}
+		  
+
 Bool ProcessStartOfGame(char *line){
   char name[30+1],name2[30+1],rating[30+1],rating2[30+1];
   char rated[30+1];
-  char color[30+1];
   int time, inc;
   int i;
   if(!runData.loggedIn) return FALSE;
   /*
    *  Detect start of game, find gametype and rating of opponent
    */
-  if ((sscanf(line, 
-	     "Creating: %30s (%30[^)]) %30s (%30[^)]) %30s %30s %d %d", 
-	     name, 
-	     rating, 
-	     name2, 
-	     rating2, 
-	     rated, 
-	     runData.icsVariant, 
-	     &time, 
-	     &inc) == 8)
-   || (sscanf(line, 
-	     "Creating: %30s (%30[^)]) [%30[^]]] %30s (%30[^)]) %30s %30s %d %d", 
-	     name, 
-	     rating, 
-	     color, 
-	     name2, 
-	     rating2, 
-	     rated, 
-	     runData.icsVariant, 
-	     &time, 
-	     &inc) == 9)
-   ) {
+  if (
+      ParseCreating(line,
+		    name, 
+		    rating, 
+		    name2, 
+		    rating2, 
+		    rated, 
+		    runData.icsVariant, 
+		    &time, 
+		    &inc)
+      ) {
     logme(LOG_DEBUG, "Detected start of game: [%s] (%s) vs [%s] (%s) [%s] [%s] %d %d", 
 	  name, rating, name2, rating2,rated,runData.icsVariant,time,inc);
+
     runData.hideFromProxy=TRUE;
     if(appData.sendGameStart){
         ExecCommandList(appData.sendGameStart,0,FALSE);
@@ -1587,13 +2207,15 @@ Bool ProcessStartOfGame(char *line){
                      runData.currentTourney);
         }
     }
-    /* update our state */
-    runData.inGame=TRUE;
+    /* generic engine setup */
+    SetupEngine();
     /* send opponent name and ratings to computer */
     if (!strcmp(name, runData.handle)) {
 	SendToComputer("name %s\n", name2);
 	SendToComputer("rating %d %d\n", atoi(rating), atoi(rating2));
     }
+    /* send time info to computer */
+    SetupLevel(time,inc);
     /* send variant to computer */
     strcpy(runData.chessVariant,"normal");
     runData.noCastle=FALSE;
@@ -1623,24 +2245,12 @@ Bool ProcessStartOfGame(char *line){
     	}
     }
     logme(LOG_DEBUG,"Chess variant is now set to \"%s\"",runData.chessVariant);
-    runData.useMoveList=UseMoveList();
-    if (!strcmp(name2, runData.handle)) {
-	SendToComputer("name %s\n", name);
-	SendToComputer("rating %d %d\n", atoi(rating2), atoi(rating));
-    }
-    if(runData.useMoveList){
-	/* reset movelist and ask for the moves */
-	runData.moveList[0] = '\0';
-	SendMarker(ASKSTARTMOVES);
-	if (runData.longAlgMoves)
-	    InternalIcsCommand("moves l\n");
-	else
-	    InternalIcsCommand("moves\n");
-	runData.waitingForMoveList =TRUE;
-    }
     /* update our state */
+    runData.inGame=TRUE;
+    runData.useMoveList=UseMoveList();
     runData.waitingForFirstBoard = TRUE;
     runData.engineMovesPlayed=0;
+    runData.adjournedGame=FALSE;
     return TRUE;
   }
   /*
@@ -1652,6 +2262,10 @@ Bool ProcessStartOfGame(char *line){
       runData.hideFromProxy=TRUE;
     sscanf(line, "{Game %d", &runData.gameID);
     logme(LOG_INFO, "Current game has ID: %d", runData.gameID);
+    if(strstr(line, ") Continuing ")){
+	logme(LOG_DEBUG,"We are resuming an adjourned game.");
+	runData.adjournedGame=TRUE;
+    }
     return TRUE;
   } 
   return FALSE;
@@ -1661,6 +2275,9 @@ void ProcessFeedback(char *line){
   char *p;
   if(!runData.loggedIn) return ;
   /* anything else might be feedback */
+  if(IsAMarker(line)){
+      return;
+  }
   if(IsWhiteSpace(line)){
       p="";
   }else{
@@ -1669,7 +2286,7 @@ void ProcessFeedback(char *line){
   if(p && runData.forwarding){
     if(strstr(line,"Your communication has been queued for")) return;
     if(strstr(line,"You have reached the communication")) return;
-    Feedback(runData.forwardingMask,"%s",p);
+    Feedback(runData.forwardingMask&~PROXY,"%s",p);
     runData.forwarding++;
   }
 }
@@ -1677,14 +2294,22 @@ void ProcessFeedback(char *line){
 Bool ProcessMoveList(char *line){
     move_t move,move2;
     char dummy;
+    IcsBoard initialBoard;
     if(!runData.loggedIn) return FALSE;
     if(!runData.waitingForMoveList) return FALSE;
     if(IsMarker(ASKSTARTMOVES,line)){
         logme(LOG_DEBUG,"Start of move list detected.");
+	/* reset movelist and ask for the moves */
+	runData.moveList[0] = '\0';
         runData.parsingMoveList=TRUE;
         return TRUE;
     }    
     if(runData.parsingMoveList){
+	if(ParseBoard(&initialBoard,line) 
+	   && (initialBoard.status==-4 /*FICS*/ || initialBoard.status==-3 /*ICC*/)){
+	    SendBoardToComputer(&initialBoard,TRUE);
+	    return TRUE;
+	}
             /*
              *  Retrieve the movelist
              */
@@ -1713,8 +2338,9 @@ Bool ProcessMoveList(char *line){
         if (sscanf(line, " {%*s in progress} %c", &dummy) == 1) {
             logme(LOG_INFO, "Found end of movelist; %c on move", 
                   runData.icsBoard.onMove);
-            SetupEngineOptions(&(runData.icsBoard));
-            HandleBoard(&(runData.icsBoard),runData.moveList,FALSE);
+	    Force();
+	    SendMovesToComputer(runData.moveList);
+            HandleBoard(&(runData.icsBoard),TRUE);
             runData.parsingMoveList=FALSE;
             runData.waitingForMoveList=FALSE;
             return TRUE;
@@ -1723,30 +2349,95 @@ Bool ProcessMoveList(char *line){
     return FALSE;
 }
 
+/*********************************************************************
+ *
+ * Normally ProcessBoard() parses the board and hands the parsed board 
+ * over to HandleBoard() with the flag engineBoardIsCurrent=FALSE.
+ *
+ * Some special processing is done during the beginning of the game.
+ * (1) If we are not using a movelist and we are in a shuffle or
+ * adjourned game then the initial board is sent to the engine.
+ * HandleBoard is called with engineBoardIsCurrent=TRUE.
+ * (2) If we are using a movelist then we ask for a movelist. This
+ * movelist is subsequently parsed by ProcessMoveList().
+ * While waiting for the movelist processing to finish (visible
+ * from the state of the flag runData.waitingForMoveList) boards
+ * that come in are saved (in runData.icsBoard) but not sent
+ * to HandleBoard(). When ProcessMoveList() is finished reading the 
+ * movelist it will use the last of these saved boards to 
+ * call HandleBoard() with the  flag engineBoardIsCurrent=TRUE.
+ *
+ *********************************************************************/
 Bool ProcessBoard(char *line){
   char *oppname;
-  IcsBoard icsBoardCopy;
+  char logboard[256];
+  IcsBoard icsBoardCopy, icsBoard;
   if(!runData.loggedIn) return FALSE;
-  if(!ParseBoard(&(runData.icsBoard),line)) return FALSE;
-  memcpy(&icsBoardCopy,&runData.icsBoard,sizeof(IcsBoard));
-  if(runData.icsBoard.status==1 /* my move */ || runData.icsBoard.status==-1 /* your move */){      icsBoardCopy.status=0; // observing
-  }      
+  /********************************************************************
+   * See if current line is really a board.
+   ********************************************************************/
+  if(!ParseBoard(&icsBoard,line)) return FALSE;
+  /********************************************************************
+   * Log board.
+   ********************************************************************/
+  BoardToFen(logboard,&icsBoard);
+  logme(LOG_DEBUG,"fen=\"%s\"\n",logboard);
+  /********************************************************************
+   * Save board for proxy.
+   ********************************************************************/
+  memcpy(&icsBoardCopy,&icsBoard,sizeof(IcsBoard));
+  /********************************************************************
+   * When xboard connects to the proxy it never sees an ongoing game.
+   * This ensures its role is completely passive.
+   ********************************************************************/
+  if(icsBoard.status==1 /* my move */ || icsBoard.status==-1 /* your move */){      
+      icsBoardCopy.status=0; // observing
+  }  
+  /********************************************************************
+   * Put aways string version of board for use with proxy,
+   ********************************************************************/    
   BoardToString(runData.lineBoard, &icsBoardCopy);
+  /********************************************************************
+   * Boards that are sent as part of a movelist are special.
+   * They should be processed by a movelist parser.
+   ********************************************************************/
+  if(icsBoard.status==-4 /* FICS */ || icsBoard.status==-3 /* ICC */){
+      return FALSE;
+  }
+  /********************************************************************
+   * Ignore boards when we are not in a game.
+   ********************************************************************/
   if(!runData.inGame) return TRUE;
-  if(runData.icsBoard.status!=1 &&  runData.icsBoard.status!=-1){
+  /********************************************************************
+   * Ignore boards that are not part of the current game.
+   ********************************************************************/
+  if(icsBoard.status!=1 &&  icsBoard.status!=-1){
       return TRUE;
   }
+  /********************************************************************
+   * Ok. Save board so that ProcessMoveList() can use it.
+   ********************************************************************/
+  memcpy(&(runData.icsBoard),&icsBoard,sizeof(IcsBoard));
   if(runData.waitingForFirstBoard){
+    /********************************************************************
+     * Ok we are seeing the first board of the current game.
+     ********************************************************************/
+    /********************************************************************
+     * Find my color and name of opponent.
+     ********************************************************************/
     if (!strcmp(runData.icsBoard.nameOfWhite, runData.handle)) {
       logme(LOG_INFO, "I'm playing white.");
       runData.computerIsWhite = TRUE;
       oppname = runData.icsBoard.nameOfBlack;
-      
     } else {
       logme(LOG_INFO, "I'm playing black.");
       runData.computerIsWhite = FALSE;
       oppname = runData.icsBoard.nameOfWhite;
     }
+    /********************************************************************
+     * Count how many consecutive times we played this opponent. This 
+     * information is used in ProcessIncomingMatches().
+     ********************************************************************/
     if (!strcmp(runData.lastPlayer, oppname)) {
       runData.numGamesInSeries++;
     } else {
@@ -1754,27 +2445,55 @@ Bool ProcessBoard(char *line){
       strcpy(runData.lastPlayer, oppname);
     }
     if(!runData.useMoveList){
+        /********************************************************************
+         * We are not using a movelist. Send board to engine if necessary.
+         ********************************************************************/
 	Bool ignoreStartBoard;
 	ignoreStartBoard=FALSE;
 	if(!IsShuffle(runData.chessVariant)){
 	    ignoreStartBoard=TRUE;
 	}
 	SendBoardToComputer(&runData.icsBoard,ignoreStartBoard);
-	SetupEngineOptions(&(runData.icsBoard));
-	HandleBoard(&(runData.icsBoard),NULL,TRUE);
+        /********************************************************************
+         * Ok prepare engine to think (when on move).
+         ********************************************************************/
+	HandleBoard(&(runData.icsBoard),TRUE);
+    }else{
+        /********************************************************************
+         * We are using a movelist. Ask for it.
+         ********************************************************************/
+	SendMarker(ASKSTARTMOVES);
+	if (runData.longAlgMoves && runData.icsType==ICS_FICS){
+	    InternalIcsCommand("moves l\n");
+	}else{
+	    InternalIcsCommand("moves\n");
+	}
+	runData.waitingForMoveList =TRUE;
     }
+    /********************************************************************
+     * Save FEN of initial board for pgn generation. 
+     ********************************************************************/
+    BoardToFen(runData.initialFen,&runData.icsBoard);
+    /********************************************************************
+     * Make sure we do not get here a second time.
+     ********************************************************************/
     runData.waitingForFirstBoard = FALSE;
 
     return TRUE;
   }
   if(runData.waitingForMoveList){
-    /* 
-     * Avoid prematurely sending moves to the engine. They will be sent as part
-     * of the movelist. 
-     */
+      /************************************************************************** 
+       * Avoid prematurely sending moves to the engine. They will be sent as part
+       * of the movelist. 
+       **************************************************************************/
       return TRUE;
   }
-  HandleBoard(&(runData.icsBoard),NULL,FALSE);
+  /************************************************************************** 
+   * If we make it all the way here then that means we have a regular 
+   * board, not at the beginning of the game. So we can hand it safely
+   * to HandleBoard().
+   **************************************************************************/
+  HandleBoard(&(runData.icsBoard),FALSE);
   return TRUE;
 }
 
@@ -1804,7 +2523,7 @@ Bool ProcessGameEnd(char *line){
        strncasecmp(handle2,runData.handle,strlen(runData.handle))){
 		       return TRUE;
        }		 
-    logme(LOG_INFO, "Detected end of game: %s", line);
+    logme(LOG_INFO, "Detected end of game.");
     {
         int mask=CONSOLE|SHORTLOG|PROXY;
         if(!appData.ownerQuiet){
@@ -1844,12 +2563,12 @@ Bool ProcessGameEnd(char *line){
     }
     SendMarker(DOCLEANUPS);
     runData.gameID = -1;
-    runData.moveNum = -1;
+    runData.nextMoveNum = -1;
     runData.timeOfLastGame = time(0);
     if (runData.sigint) {
       InterruptComputer();
     }
-    if (runData.haveCmdResult && !strcmp(result,"*")) {
+    if (runData.haveCmdResult && strcmp(result,"*")) {
       Result(result);
     }
     NewGame();
@@ -1859,10 +2578,12 @@ Bool ProcessGameEnd(char *line){
 }
 
 Bool ProcessMiscFilters(char *line){
+    char name[30+1];
   /* Filter out some inconvienient lines.
    */
   if(strstr(line,"You can \"accept\" or \"decline\", or propose different parameters.")) return TRUE;
-  return FALSE;   
+  if(sscanf(line,"(told %30s",name)==1) return TRUE;
+  return FALSE; 
 }
 
 Bool ProcessMoreTime(char *line){
@@ -1877,6 +2598,100 @@ Bool ProcessMoreTime(char *line){
     return TRUE;
   }
   return FALSE;
+}
+
+/**********************************************************************************
+ * The format for indicating the start of a movelist on ICC
+ * is:
+ * <string> (\(<number>\)|eps) vs. <string> (\(<number\)|eps) --- <string> <string>
+ * I do not see how to parse this with scanf(). Hence use strtok().
+ **********************************************************************************/
+Bool ParseICCStartOfMoveList(char *line, 
+			     char *nameWhite, 
+			     char *ratingWhite,
+			     char *nameBlack,
+			     char *ratingBlack,
+			     char *pgnDate,
+			     char *pgnTime){
+    char *line_;
+    Bool ret;
+    char *token;
+    enum {
+	INIT,
+	AFTER_WHITE_NAME,
+	AFTER_WHITE_RATING,
+	AFTER_BLACK_NAME,
+	AFTER_BLACK_RATING,
+	AFTER_DATE,
+    } state;
+    state=INIT;
+    ret=FALSE;
+    line_=strdup(line);
+    token=strtok(line_,"\n\r ()");
+    while(token){
+	//	logme(LOG_DEBUG,"state=%d token=%s\n",state,token);
+	switch(state){
+	case INIT:
+	    strncpy(nameWhite,token,20);
+	    state=AFTER_WHITE_NAME;
+	    break;
+	case AFTER_WHITE_NAME:
+	    strcpy(ratingWhite,"0");
+	    if(isdigit(token[0])){
+		strncpy(ratingWhite,token,20);
+		/* eat vs. */
+		token=strtok(NULL,"\n\r ()");
+	    }
+	    if(!strcmp(token,"vs.")){
+		state=AFTER_WHITE_RATING;		
+	    }else{
+		goto finish;
+	    }	    
+	    break;
+	case AFTER_WHITE_RATING:
+	    strncpy(nameBlack,token,20);
+	    state=AFTER_BLACK_NAME;
+	    break;
+	case AFTER_BLACK_NAME:
+	    strcpy(ratingBlack,"0");
+	    if(isdigit(token[0])){
+		strncpy(ratingBlack,token,20);
+		/* eat --- */
+		token=strtok(NULL,"\n\r ()");
+	    }
+	    if(!strcmp(token,"---")){
+		state=AFTER_BLACK_RATING;		
+	    }else{
+		goto finish;
+	    }	    
+	    break;
+	case AFTER_BLACK_RATING:
+	    strcpy(pgnDate,"0000.00.00");
+	    if(token[4]=='.'){
+		strncpy(pgnDate,token,11);
+		pgnDate[10]='\0';
+		state=AFTER_DATE;		
+	    }else{
+		goto finish;
+	    }
+	    break;
+	case AFTER_DATE:
+	    strcpy(pgnTime,"00:00:00");
+	    if(token[2]==':'){
+		strncpy(pgnTime,token,9);
+		pgnTime[8]='\0';
+		ret=TRUE;
+	    }
+	    goto finish;
+	    break;
+	default:
+	    break;
+	}
+	token=strtok(NULL,"\n\r ()");
+    }
+finish:
+    free(line_);
+    return ret;
 }
 
 Bool ProcessCreatePGN(char *line){
@@ -1906,16 +2721,24 @@ Bool ProcessCreatePGN(char *line){
   static char variant[30+1]="";
   static int initial=0;
   static int increment=0;
-  static int state=0;
   static int colNo=0;
+  static IcsBoard initialBoard;
+  static Bool initialBoardSeen;
 
-  /*  static char *lastLine=NULL;*/
   char dummy;
+
+/* States of movelist parsing */
+  static enum {PGN_INIT,
+	PGN_DEBUG,
+	PGN_START_MOVES,
+	PGN_READING_MOVES} state=PGN_INIT;
+
   if(!runData.loggedIn) return FALSE;  
   if(IsMarker(ASKLASTMOVES,line)){
     logme(LOG_DEBUG,"Start of last move list detected.");
     runData.processingLastMoves=TRUE;
-    state=0;
+    initialBoardSeen=FALSE;
+    state=PGN_INIT;
     colNo=0;
     return TRUE;
   }
@@ -1926,7 +2749,7 @@ Bool ProcessCreatePGN(char *line){
     return TRUE;
   }
   // FICS start of movelist
-  if(state==0 && sscanf(line,"%30s (%[^)]) vs. %30s (%[^)]) --- %30s %30s %d, %30s %30s %30s",
+  if(state==PGN_INIT && sscanf(line,"%30s (%[^)]) vs. %30s (%[^)]) --- %30s %30s %d, %30s %30s %30s",
 			nameWhite,
 			ratingWhite,
 			nameBlack,
@@ -1939,38 +2762,40 @@ Bool ProcessCreatePGN(char *line){
 			year)==10){
     snprintf(pgnDate, sizeof(pgnDate), "%s.%02d.%02d", year, MonthNumber(month), day);
     snprintf(pgnTime, sizeof(pgnTime), "%s:00", hoursSecs);
-    state=-1;
+    state=PGN_DEBUG;
+  } 
+  // ICC
+  else if(state==PGN_INIT && ParseICCStartOfMoveList(line,
+			       nameWhite,
+			       ratingWhite,
+			       nameBlack,
+			       ratingBlack,
+			       pgnDate,
+			       pgnTime)){
+
+      state=PGN_DEBUG; 
   }
   
-  // ICS start of movelist
-  if(state==0 && sscanf(line,"%30s (%[^)]) vs. %30s (%[^)]) --- %10s %8s",
-			nameWhite,
-			ratingWhite,
-			nameBlack,
-			ratingBlack,
-			pgnDate,
-			pgnTime)==6 && pgnDate[4]=='.' && pgnTime[2]==':') {
-      state=-1; // slight abuse of state
-  }
-  
-  if (state==-1) {
-      logme(LOG_DEBUG,"[nameWhite=%s]  [ratingWhite=%s] [nameBlack=%s] [ratingBlack=%s] [pgnDate=%s] [pgnTime=%s]",
+  if (state==PGN_DEBUG) { 
+      /* We have state PGN_DEBUG to do some logging. */
+      logme(LOG_DEBUG,"[nameWhite=%s]  [ratingWhite=%s] [nameBlack=%s] [ratingBlack=%s]"
+                      " [pgnDate=%s] [pgnTime=%s]",
 	    nameWhite,
 	    ratingWhite,
 	    nameBlack,
 	    ratingBlack,
 	    pgnDate,
 	    pgnTime);
-      state=1;
+      state=PGN_START_MOVES;
       return TRUE;
   }
-  
-  if(state==1 && sscanf(line,"%30s%30s match, initial time: %d minute%*2s increment: %d",
+
+  if(state==PGN_START_MOVES && sscanf(line,"%30s%30s match, initial time: %d minute%*2s increment: %d",
 			rated,
 			variant,
 			&initial,
 			&increment)==4){
-      state=2;
+      state=PGN_READING_MOVES;
       rated[0]=tolower(rated[0]);
       logme(LOG_DEBUG,"[rated=%s]  [variant=%s] [initial=%d] [increment=%d]",
 	    rated,
@@ -1979,7 +2804,16 @@ Bool ProcessCreatePGN(char *line){
 	    increment);
       return TRUE;
   }
-  if (state==2 && sscanf(line, "%3d. %15s (%*s %15s (%*s", &moveNumber, move, move2) == 3) {
+
+  if(state==PGN_READING_MOVES && ParseBoard(&initialBoard,line) && 
+     (initialBoard.status==-4 /* FICS */ || initialBoard.status==-3 /* ICC */)){
+      initialBoardSeen=TRUE;
+      BoardToFen(runData.initialFen,&initialBoard);
+      logme(LOG_DEBUG,"Initial board seen. Saving it.");
+      return TRUE;
+  }
+
+  if (state==PGN_READING_MOVES && sscanf(line, "%3d. %15s (%*s %15s (%*s", &moveNumber, move, move2) == 3) {
     ConvIcsSanToComp(move);
     ConvIcsSanToComp(move2);
     snprintf(miniPgnDesc, sizeof(miniPgnDesc), "%d. %s %s ", moveNumber, move, move2);
@@ -1993,7 +2827,7 @@ Bool ProcessCreatePGN(char *line){
     colNo+=strlen(miniPgnDesc);
     return TRUE;
   }
-  if (state==2 && sscanf(line, "%3d. %15s (%*s %15s (%*s", &moveNumber, move, move2) == 2) {
+  if (state==PGN_READING_MOVES && sscanf(line, "%3d. %15s (%*s %15s (%*s", &moveNumber, move, move2) == 2) {
     ConvIcsSanToComp(move);
     snprintf(miniPgnDesc, sizeof(miniPgnDesc), "%d. %s ", moveNumber, move);
     if ((colNo + strlen(miniPgnDesc)) > MAX_PGN_FILE_LINE) {
@@ -2009,8 +2843,8 @@ Bool ProcessCreatePGN(char *line){
   }  
   memset(result,0,30+1);
   memset(resultString,0,60+1);
-  if(state==2 && sscanf(line,"%*[ ]{%60[^}]}%*[ ]%30[^ \r\n]",resultString,result) ==2){
-    state=0;
+  if(state==PGN_READING_MOVES && sscanf(line,"%*[ ]{%60[^}]}%*[ ]%30[^ \r\n]",resultString,result) ==2){
+    state=PGN_INIT;
     logme(LOG_DEBUG,"[ResultString=%s] [Result=%s]",resultString,result);
     runData.processingLastMoves=FALSE;
     if (appData.pgnFile[0] == '|') {
@@ -2040,6 +2874,23 @@ Bool ProcessCreatePGN(char *line){
     fprintf(pgnFile,"[TimeControl \"%d+%d\"]\n",initial,increment);
     fprintf(pgnFile,"[Mode \"ICS\"]\n");
     fprintf(pgnFile,"[Result \"%s\"]\n",result);
+    if(strcmp(runData.chessVariant,"normal")){
+	fprintf(pgnFile,"[Variant \"%s\"]\n",runData.chessVariant);
+    }
+    if(initialBoardSeen
+       ||
+       (IsIcsShuffle(runData.icsVariant) && !runData.adjournedGame)
+       ){
+	fprintf(pgnFile,"[Setup \"1\"]\n");
+	fprintf(pgnFile,"[FEN \"%s\"]\n",runData.initialFen);
+    }
+    if(IsIcsShuffle(runData.icsVariant) 
+       &&
+       (!initialBoardSeen && runData.adjournedGame)
+       ){
+	logme(LOG_ERROR,"This is an adjourned shuffle game and we don't know how to get\n"
+	                "the initial board. The generated pgn will likely be incorrect.");
+    }
     fprintf(pgnFile,"\n");
     fprintf(pgnFile,"%s",pgnDesc);
     if((colNo+strlen(resultString)) > MAX_PGN_FILE_LINE) {
@@ -2063,7 +2914,7 @@ DOCLEANUPS marker.");
     logme(LOG_INFO,"Putting runData.processingLastMoves=FALSE.");
     runData.processingLastMoves=FALSE;
     pgnDesc[0]='\0';
-    state=0;
+    state=PGN_INIT;
     colNo=0;
   }
   return FALSE;
@@ -2128,8 +2979,7 @@ Bool ProcessIllegalMove(char *line){
        * We have the problem that the illegal move might be from a previous game.
        */
 	if(runData.engineMovesPlayed>0){
-	    logme(LOG_DEBUG,"Something bad happened. Bailing out.");
-	    SendToIcs("resign\n");
+	    BailOut("ICS claims engine move is illegal... Bailing out.");
 	}else{
 	    logme(LOG_DEBUG,"Not bailing out since we are at the start of the game.");
 	}
@@ -2158,6 +3008,7 @@ void ProcessIcsLine(char *line, char *queue){
   if(ProcessNotifications(line))goto finish;
   if(ProcessOwnerNotify(line))goto finish;
   if(ProcessIncomingMatches(line))goto finish;
+  if(ProcessICCTourneyGameStart(line))goto finish;
   if(ProcessTourneyNotifications(line)) goto finish;
   if(ProcessStandings(line)) goto finish;
   if(ProcessFlaggedOpponent(line))goto finish;
@@ -2171,25 +3022,24 @@ void ProcessIcsLine(char *line, char *queue){
   if(ProcessCleanUps(line))goto finish;
   if(ProcessMiscFilters(line))goto finish;
   ProcessFeedback(line);
-
 finish:
+
   if(!strcmp(old_line,"\012\015\015")){
       // This is a spurious character sequence inserted by FICS
       // timeseal. Since it is unlikely to occur normally
       // we just drop it. 
   }else if(IsMarker(PROXYPROMPT,old_line)){
       SendToProxy("%s", runData.lastIcsPrompt);
-  }else if(!strncmp(old_line,"<12>",4)){
-      SendToProxy("%s\r\n%s",runData.lineBoard,runData.lastIcsPrompt);
   }else if(runData.proxyLoginState==PROXY_LOGGED_IN &&
 	   !runData.hideFromProxy &&
-	   !runData.forwarding && 
 	    !IsAMarker(old_line) && 
 	   !runData.internalIcsCommand){
-      if(!strncmp(runData.lastIcsPrompt,queue,6)){
-	  SendToProxy("%s%s",old_line,runData.lastIcsPrompt);
-      }else{
-	  SendToProxy("%s",old_line);
+       if(!strncmp(old_line,"<12>",4)){
+	   SendToProxy("%s\r\n%s",runData.lineBoard,runData.lastIcsPrompt);
+       }else if(!strncmp(runData.lastIcsPrompt,queue,6)){
+	   SendToProxy("%s%s",old_line,runData.lastIcsPrompt);
+       }else{
+	   SendToProxy("%s",old_line);
       }
   }
 
