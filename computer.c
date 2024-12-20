@@ -540,8 +540,10 @@ void ProcessComputerLine(char *line, char *queue)
       SendToIcs("draw\n");
   } else if (!strncmp(line,"offer draw",10)) {
       SendToIcs("draw\n");
-  } else if (!strncmp(line, "resign",6)) {
-    SendToIcs("resign\n");
+  } else if (!strncmp(line,"resign",6) ||
+             (strncmp(line,"1-0",3) == 0 && strstr(line+3,"resigns")) ||
+             (strncmp(line,"0-1",3) == 0 && strstr(line+3,"resigns"))) {
+      SendToIcs("resign\n");
   } else if (!appData.engineQuiet && !strncmp(line, "tellics ", 8)) {
       SendToIcs("%s\n", line + 8);
   } else if(!appData.engineQuiet && !strncmp(line,"tellothers ",11)) {
