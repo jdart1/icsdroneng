@@ -131,7 +131,8 @@ int ProcessRawInput(int fd, char *buf, int sizeofbuf, void (*LineFunc)(char *lin
 	//	ExitOn(EXIT_HARDQUIT,"Unknown error in ProcessRawInput.");
 	return ERROR;
     } else if (num == 0) {  /* disconnection */
-        logme(LOG_ERROR,"End of file in ProcessRawInput");
+       /* suppress this - can be really verbose
+          logme(LOG_ERROR,"End of file in ProcessRawInput"); */
 	return ERROR;          
     } else if (num > 0) {
 	buf[(pos += num)] = '\0';
